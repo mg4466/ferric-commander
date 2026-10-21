@@ -12,12 +12,14 @@
 //! specification; `centered_fixed` is its pixel analogue.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 
 use crate::app::{App, ConfirmAction, InputState, ModalState};
+use crate::format::{format_size, truncate_path};
+use crate::tasks::{ActiveTaskHandle, IoOperation, TaskPhase};
 use crate::theme::Theme;
 
 /// A rectangle covering `percent_x`% by `percent_y`% of `area`, centred.
@@ -65,21 +67,25 @@ pub fn render(frame: &mut Frame, app: &App) {
             title,
             prompt,
             action,
+            allow_skip,
         } => {
             // The headline adapts to what is being confirmed, so the wording
             // never claims "overwrite" for an operation that cannot overwrite.
             let banner = match action {
                 ConfirmAction::RenameOverwrite { .. } => "This cannot be undone.",
+                ConfirmAction::Task { task } if task.op == IoOperation::Delete => {
+                    "This cannot be undone."
+                }
+                ConfirmAction::Task { .. } => "",
             };
-            render_text_dialog(
-                frame,
-                area,
-                title,
-                prompt,
-                banner,
-                &[("Enter", "confirm"), ("Esc", "cancel")],
-                &theme,
-            );
+
+            let hints: &[(&str, &str)] = if *allow_skip {
+                &[("Enter", "overwrite"), ("s", "skip"), ("Esc", "cancel")]
+            } else {
+                &[("Enter", "confirm"), ("Esc", "cancel")]
+            };
+
+            render_text_dialog(frame, area, title, prompt, banner, hints, &theme);
         }
         ModalState::Input { title, input, .. } => {
             let rect = centered_fixed(area, 64, 7);
@@ -108,11 +114,12 @@ pub fn render(frame: &mut Frame, app: &App) {
                 footer,
             );
         }
-        ModalState::Progress => {
-            // The real ratio comes from the worker in Phase 4; the view exists
-            // now so the geometry is settled and testable.
-            render_progress(frame, area, "Working", 0.0, "starting", &theme);
-        }
+        ModalState::Progress => match &app.active_task {
+            Some(task) => render_task_progress(frame, task, area, &theme),
+            // Not reachable through normal flow: the modal is only opened by
+            // `start_task`, which always installs the handle first.
+            None => render_task_progress_placeholder(frame, area, &theme),
+        },
         ModalState::ErrorReport {
             title,
             errors,
@@ -219,41 +226,132 @@ fn render_text_dialog(
     frame.render_widget(footer_line(hints, theme), footer);
 }
 
-/// Progress dialog: a gauge plus the file currently being worked on.
-pub fn render_progress(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    ratio: f64,
-    label: &str,
-    theme: &Theme,
-) {
-    let rect = centered_fixed(area, 60, 6);
-    let block = dialog_block(title, theme);
+/// Progress dialog: a gauge, the file being worked on, and the counters.
+///
+/// All of this is read straight from the handle, which `App::pump_worker`
+/// updates from the worker's messages; the renderer never talks to the thread.
+fn render_task_progress(frame: &mut Frame, task: &ActiveTaskHandle, area: Rect, theme: &Theme) {
+    let rect = centered_fixed(area, 66, 8);
+    let title = format!("{}…", task.op.gerund());
+    let block = dialog_block(&title, theme);
     let inner = block.inner(rect);
 
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
 
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let ratio = task.fraction();
     let gauge = Gauge::default()
         .gauge_style(Style::default().fg(theme.dir_fg).bg(theme.cursor_bg))
-        .ratio(ratio.clamp(0.0, 1.0))
-        .label(format!("{:.0}%", ratio.clamp(0.0, 1.0) * 100.0));
+        .ratio(ratio)
+        .label(format!("{:.0}%", ratio * 100.0));
 
     frame.render_widget(gauge, Rect { height: 1, ..inner });
 
+    // Current file, kept to one line by shortening the middle of the path.
+    let width = inner.width.saturating_sub(2) as usize;
+    let file = if task.current_file.is_empty() {
+        "…".to_string()
+    } else {
+        truncate_path(&task.current_file, width.max(8))
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            label.to_string(),
-            Style::default().fg(theme.border_inactive),
-        )))
-        .alignment(Alignment::Left),
+            file,
+            Style::default().fg(theme.fg),
+        ))),
         Rect {
             y: inner.y + 2,
             height: 1,
             ..inner
         },
     );
+
+    // Counters: items always, bytes when they are known (delete has none).
+    // Before `Started` arrives the totals are genuinely unknown, and "0 / 0
+    // items" would read as a finished task rather than a scan in progress.
+    let bytes = if task.total_bytes > 0 {
+        format!(
+            "   {} / {}",
+            format_size(task.bytes_done),
+            format_size(task.total_bytes)
+        )
+    } else {
+        String::new()
+    };
+    let counters = if task.phase == TaskPhase::Scanning {
+        let counted = if task.total_items > 0 {
+            format!(" ({} so far)", task.total_items)
+        } else {
+            String::new()
+        };
+        format!("Measuring the work{counted}…")
+    } else {
+        format!("{} / {} items{}", task.items_done, task.total_items, bytes)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            counters,
+            Style::default().fg(theme.border_inactive),
+        ))),
+        Rect {
+            y: inner.y + 3,
+            height: 1,
+            ..inner
+        },
+    );
+
+    if task.error_count > 0 && inner.height > 5 {
+        let detail = task
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "error".to_string());
+        let notice = format!(
+            "{} error(s): {}",
+            task.error_count,
+            truncate_path(&detail, width.max(8))
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                notice,
+                Style::default().fg(theme.error_fg),
+            ))),
+            Rect {
+                y: inner.y + 4,
+                height: 1,
+                ..inner
+            },
+        );
+    }
+
+    // Footer: what the user can do next, or what the app is already doing.
+    let footer = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1,
+        ..inner
+    };
+    match task.phase {
+        TaskPhase::Cancelling => frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Cancelling… (waiting for the current chunk to finish)",
+                Style::default().fg(theme.error_fg),
+            ))),
+            footer,
+        ),
+        _ => frame.render_widget(footer_line(&[("Esc", "cancel")], theme), footer),
+    }
+}
+
+/// Shown for the one frame between opening the progress modal and installing
+/// the handle.
+fn render_task_progress_placeholder(frame: &mut Frame, area: Rect, theme: &Theme) {
+    let rect = centered_fixed(area, 66, 8);
+    let block = dialog_block("Working…", theme);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
 }
 
 fn dialog_block(title: &str, theme: &Theme) -> Block<'static> {
@@ -341,8 +439,27 @@ mod tests {
         assert_eq!(line.spans[1].style.bg, Some(theme.cursor_bg));
     }
 
-    #[test]
-    fn progress_view_renders_a_percentage_and_label() {
+    /// A handle good enough to render: the progress view only reads fields.
+    fn fake_handle(phase: TaskPhase) -> ActiveTaskHandle {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let (cancel_tx, _cancel_rx) = std::sync::mpsc::channel();
+        ActiveTaskHandle {
+            rx,
+            cancel_tx,
+            op: IoOperation::Copy,
+            phase,
+            current_file: "/data/big.iso".to_string(),
+            items_done: 1,
+            total_items: 4,
+            bytes_done: 42,
+            total_bytes: 100,
+            error_count: 0,
+            skipped_count: 0,
+            last_error: None,
+        }
+    }
+
+    fn render_progress_text(task: &ActiveTaskHandle) -> String {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -350,19 +467,33 @@ mod tests {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_progress(frame, frame.area(), "Copying", 0.42, "big.iso", &theme))
+            .draw(|frame| render_task_progress(frame, task, frame.area(), &theme))
             .unwrap();
 
-        let text: String = terminal
+        terminal
             .backend()
             .buffer()
             .content
             .iter()
             .map(|cell| cell.symbol())
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn progress_view_renders_percentage_file_and_counters() {
+        let text = render_progress_text(&fake_handle(TaskPhase::Running));
+
         assert!(text.contains("Copying"));
-        assert!(text.contains("42%"));
-        assert!(text.contains("big.iso"));
+        assert!(text.contains("42%"), "gauge label missing: {text}");
+        assert!(text.contains("big.iso"), "current file missing");
+        assert!(text.contains("1 / 4 items"), "counters missing");
+        assert!(text.contains("Esc"), "cancel hint missing");
+    }
+
+    #[test]
+    fn progress_view_says_so_while_cancelling() {
+        let text = render_progress_text(&fake_handle(TaskPhase::Cancelling));
+        assert!(text.contains("Cancelling"), "no cancelling notice: {text}");
     }
 
     #[test]

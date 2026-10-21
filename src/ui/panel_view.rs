@@ -23,6 +23,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, HighlightSpacing, Paragraph, Row, Table, TableState};
 
+use crate::format::format_size;
 use crate::fs::panel::{DirectoryEntry, PanelState};
 use crate::theme::Theme;
 
@@ -179,38 +180,9 @@ fn kind_label(entry: &DirectoryEntry) -> Option<&'static str> {
     }
 }
 
-/// Human-readable size. Binary units (KiB powers) with the traditional "KB"
-/// label, which is what `ls -lh` and every file manager users compare us to
-/// do; showing "1.0 MiB" here would be pedantic where the spec asked for MB.
-pub fn format_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-
-    format!("{value:.1} {}", UNITS[unit])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sizes_render_in_binary_units() {
-        assert_eq!(format_size(0), "0 B");
-        assert_eq!(format_size(1023), "1023 B");
-        assert_eq!(format_size(1024), "1.0 KB");
-        assert_eq!(format_size(42_100_000), "40.1 MB");
-        assert_eq!(format_size(5 * 1024 * 1024 * 1024), "5.0 GB");
-    }
 
     #[test]
     fn kind_labels_distinguish_symlink_kinds() {

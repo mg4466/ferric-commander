@@ -528,6 +528,24 @@ Goal: Implement background Copy (F5), Move (F6), and Delete (F8) with live progr
    * Section 2: ModalState::Input groups the buffer and cursor into InputState,
      so the editing rules (character-indexed cursor, UTF-8 safe) live with the
      data they operate on instead of being loose fields on the modal.
+   * Section 2: Confirm gains allow_skip: bool, because only a conflict prompt
+     has a meaningful "skip" answer; a delete prompt must not offer one.
+   * Section 3: FileTask carries an explicit ConflictPolicy (Overwrite | Skip)
+     instead of the worker inferring intent from a bool. The policy resolved in
+     the confirm dialog is the policy the worker executes.
+   * Section 3: TaskUpdate::Completed carries skipped: Vec<PathBuf> alongside
+     skipped_errors, so "left alone on purpose" is not reported as a failure.
+     Aborted carries items_done and bytes_done, as D2 requires the abort report
+     to include counts.
+   * Section 3: ActiveTaskHandle also mirrors phase (Scanning/Running/Cancelling)
+     and last_error, so the progress dialog can say "measuring" before the scan
+     completes and can admit a mid-task failure without waiting for the summary.
+   * Section 3: overwriting an existing directory merges into it rather than
+     deleting it first. Removing the destination tree to copy a partial one over
+     it would destroy files the operation never intended to touch.
+   * Structure: a new src/format.rs holds format_size/truncate_path, which the
+     panes, the status line and the dialogs all need; putting them in ui/ would
+     have made App depend on a rendering module.
 
 7.3 Phase 7 (post-1.0) - Configurable keybindings
 

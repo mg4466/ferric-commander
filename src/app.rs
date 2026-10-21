@@ -13,11 +13,16 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::TryRecvError;
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::format::format_size;
 use crate::fs::panel::PanelState;
+use crate::tasks::{
+    self, ActiveTaskHandle, ConflictPolicy, FileTask, IoOperation, TaskPhase, TaskUpdate,
+};
 use crate::theme::{Theme, ThemeType};
 
 /// Something the app cannot do by itself because it needs the terminal.
@@ -115,6 +120,8 @@ pub enum InputAction {
 pub enum ConfirmAction {
     /// The rename destination already exists; overwriting was acknowledged.
     RenameOverwrite { from: PathBuf, to: PathBuf },
+    /// A copy, move or delete that has been fully planned and validated.
+    Task { task: FileTask },
 }
 
 /// A modal dialog, or the absence of one.
@@ -129,15 +136,17 @@ pub enum ModalState {
         title: String,
         prompt: String,
         action: ConfirmAction,
+        /// True when accepting with `s` (skip collisions) is meaningful, which
+        /// is only the case for a transfer whose destination names are taken.
+        allow_skip: bool,
     },
     Input {
         title: String,
         input: InputState,
         pending_op: InputAction,
     },
-    /// Rendered from the active task's handle. Unreachable until Phase 4 wires
-    /// the worker up, but the view is written now so the layout is settled.
-    #[allow(dead_code)]
+    /// Live progress of `App::active_task`; carries no data of its own because
+    /// the handle already has it.
     Progress,
     ErrorReport {
         title: String,
@@ -183,6 +192,9 @@ pub struct App {
     /// to `modal` as an `ErrorReport` so they cannot scroll away unseen.
     pub status_msg: Option<String>,
     pub modal: ModalState,
+    /// The running worker, if any. `None` means the UI owns all the state and
+    /// nothing is happening in the background.
+    pub active_task: Option<ActiveTaskHandle>,
     pub should_quit: bool,
 }
 
@@ -203,6 +215,7 @@ impl App {
             theme: theme_type.palette(),
             status_msg: None,
             modal: ModalState::None,
+            active_task: None,
             should_quit: false,
         })
     }
@@ -339,6 +352,19 @@ impl App {
                 None
             }
 
+            KeyCode::F(5) | KeyCode::Char('c') => {
+                self.begin_transfer(IoOperation::Copy);
+                None
+            }
+            KeyCode::F(6) | KeyCode::Char('m') => {
+                self.begin_transfer(IoOperation::Move);
+                None
+            }
+            KeyCode::F(8) | KeyCode::Char('d') | KeyCode::Delete => {
+                self.begin_delete();
+                None
+            }
+
             KeyCode::F(1) | KeyCode::Char('t') => {
                 self.cycle_theme();
                 None
@@ -457,9 +483,15 @@ impl App {
                 _ => ModalOutcome::Ignore,
             },
 
-            ModalState::Confirm { .. } => match key.code {
+            ModalState::Confirm { allow_skip, .. } => match key.code {
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     ModalOutcome::AcceptConfirm
+                }
+                // Only offered when the dialog actually has collisions to skip;
+                // otherwise `s` would be an undocumented no-op that looks like
+                // it did something.
+                KeyCode::Char('s') | KeyCode::Char('S') if *allow_skip => {
+                    ModalOutcome::AcceptSkipping
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => ModalOutcome::Cancel,
                 _ => ModalOutcome::Ignore,
@@ -493,18 +525,42 @@ impl App {
                 }
             }
 
-            // Phase 4 turns Esc here into a WorkerControl::Cancel.
-            ModalState::Progress => ModalOutcome::Ignore,
+            ModalState::Progress => match key.code {
+                KeyCode::Esc => ModalOutcome::CancelTask,
+                _ => ModalOutcome::Ignore,
+            },
         };
 
         match outcome {
             ModalOutcome::Ignore => {}
             ModalOutcome::Cancel => {
+                // Dismissing a report is not cancelling anything, so only the
+                // prompts change the status line.
+                let was_prompt = matches!(
+                    self.modal,
+                    ModalState::Input { .. } | ModalState::Confirm { .. }
+                );
                 self.modal = ModalState::None;
-                self.status_msg = Some("Cancelled.".to_string());
+                if was_prompt {
+                    self.status_msg = Some("Cancelled.".to_string());
+                }
             }
             ModalOutcome::SubmitInput => self.submit_input(),
-            ModalOutcome::AcceptConfirm => self.accept_confirm(),
+            ModalOutcome::AcceptConfirm => self.accept_confirm(false),
+            ModalOutcome::AcceptSkipping => self.accept_confirm(true),
+            ModalOutcome::CancelTask => {
+                // The modal stays open until the worker acknowledges: closing it
+                // immediately would let the user start an overlapping task on
+                // files that are still being written.
+                if let Some(task) = &mut self.active_task {
+                    task.request_cancel();
+                    task.phase = TaskPhase::Cancelling;
+                } else {
+                    // Defensive: a progress dialog with no worker behind it would
+                    // otherwise trap every key forever.
+                    self.modal = ModalState::None;
+                }
+            }
         }
     }
 
@@ -567,6 +623,7 @@ impl App {
                         .unwrap_or_else(|| to.display().to_string())
                 ),
                 action: ConfirmAction::RenameOverwrite { from, to },
+                allow_skip: false,
             };
             return;
         }
@@ -575,7 +632,10 @@ impl App {
     }
 
     /// Accept the currently open confirm dialog.
-    fn accept_confirm(&mut self) {
+    ///
+    /// `skip_existing` is the "do not overwrite" branch of a conflict dialog; it
+    /// only has an effect on a transfer.
+    fn accept_confirm(&mut self, skip_existing: bool) {
         let ModalState::Confirm { action, .. } =
             std::mem::replace(&mut self.modal, ModalState::None)
         else {
@@ -584,6 +644,239 @@ impl App {
 
         match action {
             ConfirmAction::RenameOverwrite { from, to } => self.perform_rename(from, to),
+            ConfirmAction::Task { mut task } => {
+                if skip_existing {
+                    task.policy = ConflictPolicy::Skip;
+                }
+                self.start_task(task);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- transfers
+
+    /// Plan and confirm a copy or move into the inactive pane.
+    ///
+    /// Everything that can be decided without user input is decided here:
+    /// nested sources are collapsed, impossible targets are rejected before any
+    /// dialog appears, and existing destination names are collected so the
+    /// confirmation can name them instead of silently clobbering.
+    fn begin_transfer(&mut self, op: IoOperation) {
+        if self.active_task.is_some() {
+            self.status_msg = Some("A task is already running.".to_string());
+            return;
+        }
+
+        let sources = self.active_panel().operated_paths();
+        if sources.is_empty() {
+            self.status_msg = Some("Nothing selected.".to_string());
+            return;
+        }
+
+        let destination = self.inactive_panel().cwd.clone();
+        if destination == self.active_panel().cwd {
+            self.status_msg = Some("Both panes show the same directory.".to_string());
+            return;
+        }
+
+        let (task, conflicts) = match plan_transfer(op, sources, destination) {
+            Ok(plan) => plan,
+            Err(problems) => {
+                self.show_error("Cannot start", problems);
+                return;
+            }
+        };
+
+        self.clear_status();
+        let count = task.sources.len();
+        let target = task
+            .destination
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+
+        if conflicts.is_empty() {
+            self.modal = ModalState::Confirm {
+                title: format!("{} {}", op.verb(), item_count(count)),
+                prompt: format!("Destination:\n{target}"),
+                action: ConfirmAction::Task { task },
+                allow_skip: false,
+            };
+        } else {
+            // Name the collisions rather than counting them: the user is being
+            // asked to destroy data, and "2 conflicts" does not say which two.
+            let listed: Vec<String> = conflicts
+                .iter()
+                .take(3)
+                .map(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                })
+                .collect();
+            let more = conflicts.len().saturating_sub(listed.len());
+            let mut names = listed.join(", ");
+            if more > 0 {
+                names.push_str(&format!(" and {more} more"));
+            }
+
+            self.modal = ModalState::Confirm {
+                title: format!(
+                    "{} {} — {} already present",
+                    op.verb(),
+                    item_count(count),
+                    item_count(conflicts.len())
+                ),
+                prompt: format!(
+                    "Destination:\n{target}\n\nAlready present:\n{names}\n\nOverwrite replaces them; skip leaves them untouched."
+                ),
+                action: ConfirmAction::Task { task },
+                allow_skip: true,
+            };
+        }
+    }
+
+    /// Plan and confirm a delete of the selection (or the cursor row).
+    fn begin_delete(&mut self) {
+        if self.active_task.is_some() {
+            self.status_msg = Some("A task is already running.".to_string());
+            return;
+        }
+
+        let sources = dedupe_nested(self.active_panel().operated_paths());
+        if sources.is_empty() {
+            self.status_msg = Some("Nothing selected.".to_string());
+            return;
+        }
+
+        let count = sources.len();
+        self.clear_status();
+        self.modal = ModalState::Confirm {
+            title: format!("Delete {}", item_count(count)),
+            prompt: "These entries are removed permanently.".to_string(),
+            action: ConfirmAction::Task {
+                task: FileTask {
+                    op: IoOperation::Delete,
+                    sources,
+                    destination: None,
+                    policy: ConflictPolicy::Overwrite,
+                },
+            },
+            allow_skip: false,
+        };
+    }
+
+    /// Hand a confirmed task to a worker and switch the UI into progress mode.
+    fn start_task(&mut self, task: FileTask) {
+        if self.active_task.is_some() {
+            self.modal = ModalState::None;
+            self.status_msg = Some("A task is already running.".to_string());
+            return;
+        }
+
+        self.status_msg = None;
+        self.modal = ModalState::Progress;
+        self.active_task = Some(tasks::spawn_worker(task));
+    }
+
+    /// Consume up to `max_updates` worker messages.
+    ///
+    /// Called once per frame from the event loop. The message cap is what stops
+    /// a chatty worker from starving rendering: whatever is left waits for the
+    /// next frame 16 ms later.
+    ///
+    /// The handle is temporarily taken out of `self` so that `self` stays free
+    /// for the state changes the updates cause (refreshing panes, opening the
+    /// error report) — the same double-borrow problem the specification's
+    /// original loop had.
+    pub fn pump_worker(&mut self, max_updates: usize) {
+        let Some(mut task) = self.active_task.take() else {
+            return;
+        };
+
+        let mut terminal: Option<TaskUpdate> = None;
+
+        for _ in 0..max_updates {
+            match task.rx.try_recv() {
+                Ok(update) => {
+                    let done = apply_task_update(&mut task, &update);
+                    if done {
+                        terminal = Some(update);
+                        break;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The worker died without a final message (a panic, or the
+                    // thread was killed). Do not leave the UI stuck on a
+                    // progress bar that will never move.
+                    terminal = Some(TaskUpdate::Aborted {
+                        reason: "worker stopped unexpectedly".to_string(),
+                        items_done: task.items_done,
+                        bytes_done: task.bytes_done,
+                    });
+                    break;
+                }
+            }
+        }
+
+        match terminal {
+            Some(update) => self.finish_task(update, &task),
+            None => self.active_task = Some(task),
+        }
+    }
+
+    /// Close out a finished task: resynchronise the panes, drop the selection,
+    /// and report the outcome.
+    fn finish_task(&mut self, update: TaskUpdate, task: &ActiveTaskHandle) {
+        self.active_task = None;
+        self.refresh_both_panels();
+
+        // The operands are gone or moved; keeping the selection would let the
+        // next operation act on paths that no longer exist.
+        self.left_panel.selected.clear();
+        self.right_panel.selected.clear();
+
+        match update {
+            TaskUpdate::Completed {
+                skipped_errors,
+                skipped,
+            } => {
+                let mut problems: Vec<String> = skipped_errors
+                    .iter()
+                    .map(|(path, error)| format!("{}: {error}", path.display()))
+                    .collect();
+                problems.extend(
+                    skipped
+                        .iter()
+                        .map(|path| format!("{}: skipped (destination exists)", path.display())),
+                );
+
+                if problems.is_empty() {
+                    self.modal = ModalState::None;
+                    self.status_msg = Some(format!(
+                        "{} complete: {}, {}",
+                        task.op.verb(),
+                        item_count(task.items_done),
+                        format_size(task.bytes_done)
+                    ));
+                } else {
+                    self.show_error("Finished with problems", problems);
+                }
+            }
+            TaskUpdate::Aborted {
+                reason,
+                items_done,
+                bytes_done,
+            } => {
+                self.modal = ModalState::None;
+                self.status_msg = Some(format!(
+                    "{reason} after {}, {}",
+                    item_count(items_done),
+                    format_size(bytes_done)
+                ));
+            }
+            _ => {}
         }
     }
 
@@ -630,6 +923,140 @@ enum ModalOutcome {
     Cancel,
     SubmitInput,
     AcceptConfirm,
+    /// Accept a transfer confirmation while skipping existing destinations.
+    AcceptSkipping,
+    /// Ask the running worker to stop; the modal stays until it answers.
+    CancelTask,
+}
+
+/// Fold one worker message into the handle the UI renders from.
+///
+/// Returns true when the message is terminal, i.e. the worker will not speak
+/// again.
+fn apply_task_update(task: &mut ActiveTaskHandle, update: &TaskUpdate) -> bool {
+    match update {
+        TaskUpdate::Started {
+            total_items,
+            total_bytes,
+        } => {
+            task.total_items = *total_items;
+            task.total_bytes = *total_bytes;
+            // A cancel can arrive while the pre-flight scan is still running;
+            // do not let the scan's completion undo the "cancelling" state.
+            if task.phase == TaskPhase::Scanning {
+                task.phase = TaskPhase::Running;
+            }
+        }
+        TaskUpdate::Progress {
+            current_file,
+            items_processed,
+            bytes_processed,
+        } => {
+            task.current_file = current_file.clone();
+            task.items_done = *items_processed;
+            task.bytes_done = *bytes_processed;
+        }
+        TaskUpdate::NonFatalError { path, error } => {
+            task.error_count += 1;
+            task.last_error = Some(format!("{}: {error}", path.display()));
+        }
+        TaskUpdate::Completed { skipped, .. } => task.skipped_count = skipped.len(),
+        TaskUpdate::Aborted { .. } => {}
+    }
+
+    update.is_terminal()
+}
+
+/// Turn a selection plus a destination into a validated task.
+///
+/// Returns the conflicts separately from the task: the caller decides how to
+/// ask about them, and the task itself only carries the policy that the answer
+/// produces.
+fn plan_transfer(
+    op: IoOperation,
+    sources: Vec<PathBuf>,
+    destination: PathBuf,
+) -> Result<(FileTask, Vec<PathBuf>), Vec<String>> {
+    let sources = dedupe_nested(sources);
+    let mut problems = Vec::new();
+    let mut conflicts = Vec::new();
+
+    for source in &sources {
+        let Some(name) = source.file_name() else {
+            problems.push(format!("{}: has no file name", source.display()));
+            continue;
+        };
+
+        let target = destination.join(name);
+
+        if target == *source {
+            problems.push(format!(
+                "{}: source and destination are the same path",
+                source.display()
+            ));
+            continue;
+        }
+
+        // Component-wise prefix test, so "/a/b" is caught as being inside
+        // "/a/b" while "/a/bc" is not.
+        if target.starts_with(source) {
+            problems.push(format!(
+                "cannot {} {} into itself",
+                op.verb().to_lowercase(),
+                source.display()
+            ));
+            continue;
+        }
+
+        // symlink_metadata, not exists(): a dangling symlink occupies the name.
+        if fs::symlink_metadata(&target).is_ok() {
+            conflicts.push(target);
+        }
+    }
+
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+
+    Ok((
+        FileTask {
+            op,
+            sources,
+            destination: Some(destination),
+            policy: ConflictPolicy::Overwrite,
+        },
+        conflicts,
+    ))
+}
+
+/// Collapse a selection that contains both a directory and its own descendants.
+///
+/// Selecting `src` and `src/sub/file` would otherwise copy the file twice (and
+/// delete it once and then fail on it), and reporting "1 item" while doing two
+/// units of work is the kind of thing that makes a progress bar lie.
+fn dedupe_nested(mut sources: Vec<PathBuf>) -> Vec<PathBuf> {
+    // Sort so ancestors are seen before their children; then anything already
+    // covered by an accepted ancestor is dropped.
+    sources.sort();
+    let mut kept: Vec<PathBuf> = Vec::new();
+
+    for path in sources {
+        if kept.iter().any(|ancestor| path.starts_with(ancestor)) {
+            continue;
+        }
+        kept.push(path);
+    }
+
+    kept
+}
+
+/// "1 item" / "3 items", so no dialog says "1 items".
+fn item_count(count: usize) -> String {
+    if count == 1 {
+        "1 item".to_string()
+    } else {
+        format!("{count} items")
+    }
 }
 
 /// Validate a typed name and resolve it against the source file's directory.
@@ -666,13 +1093,17 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// Unique per call: a nanosecond timestamp alone collides when two tests
+    /// start in the same clock tick, and both of them then delete each other's
+    /// directory halfway through.
     fn app_at_tempdir() -> (App, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
         let path = std::env::temp_dir().join(format!(
-            "fc-app-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "fc-app-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("file.txt"), b"x").unwrap();
@@ -688,6 +1119,7 @@ mod tests {
             theme: theme_type.palette(),
             status_msg: None,
             modal: ModalState::None,
+            active_task: None,
             should_quit: false,
         };
         (app, path)
@@ -818,7 +1250,7 @@ mod tests {
         for code in [
             KeyCode::Char('x'),
             KeyCode::Char('z'),
-            KeyCode::F(5),
+            KeyCode::F(4),
             KeyCode::Home,
         ] {
             app.handle_key_event(key(code));
@@ -1067,5 +1499,274 @@ mod tests {
         assert!(app.modal.is_none());
         assert_eq!(app.active_panel().cwd, dir);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ---------------------------------------------------------------- tasks
+
+    /// Two panes in sibling directories, plus the directory that holds both.
+    fn app_two_panes() -> (App, PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        let base = std::env::temp_dir().join(format!(
+            "fc-xfer-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let left = base.join("left");
+        let right = base.join("right");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+
+        let theme_type = ThemeType::CatppuccinMocha;
+        let app = App {
+            left_panel: PanelState::new(left).unwrap(),
+            right_panel: PanelState::new(right).unwrap(),
+            active_pane: ActivePane::Left,
+            theme_type,
+            theme: theme_type.palette(),
+            status_msg: None,
+            modal: ModalState::None,
+            active_task: None,
+            should_quit: false,
+        };
+        (app, base)
+    }
+
+    /// Spin the pump until the worker reports a terminal message. Bounded so a
+    /// hung worker fails the test instead of hanging the suite.
+    fn wait_for_task(app: &mut App) {
+        for _ in 0..1500 {
+            app.pump_worker(100);
+            if app.active_task.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("worker did not finish within three seconds");
+    }
+
+    #[test]
+    fn copy_confirms_first_then_writes_and_refreshes() {
+        let (mut app, base) = app_two_panes();
+        let source = base.join("left").join("alpha.txt");
+        let dest = base.join("right").join("alpha.txt");
+        std::fs::write(&source, b"payload").unwrap();
+        app.left_panel.refresh().unwrap();
+        app.left_panel.select_path(&source);
+
+        app.handle_key_event(key(KeyCode::F(5)));
+
+        assert!(
+            matches!(app.modal, ModalState::Confirm { .. }),
+            "copy must ask before touching the disk"
+        );
+        assert!(!dest.exists(), "nothing may be copied before confirmation");
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(
+            app.active_task.is_some(),
+            "confirming should start the worker"
+        );
+        wait_for_task(&mut app);
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
+        assert!(
+            matches!(app.modal, ModalState::None),
+            "dialog closes on success"
+        );
+        assert!(
+            app.status_msg.as_deref().unwrap_or("").starts_with("Copy"),
+            "status should summarise the operation, got {:?}",
+            app.status_msg
+        );
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn a_conflict_offers_skip_and_skip_leaves_the_destination_alone() {
+        let (mut app, base) = app_two_panes();
+        let source = base.join("left").join("alpha.txt");
+        let dest = base.join("right").join("alpha.txt");
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+        app.left_panel.refresh().unwrap();
+        app.left_panel.select_path(&source);
+
+        app.handle_key_event(key(KeyCode::F(5)));
+        match &app.modal {
+            ModalState::Confirm { allow_skip, .. } => {
+                assert!(allow_skip, "a clash must offer skip as well as overwrite");
+            }
+            other => panic!("expected a conflict confirmation, got {other:?}"),
+        }
+
+        // 's' would normally cycle the sort order; while a modal is open it must
+        // only mean skip.
+        app.handle_key_event(key(KeyCode::Char('s')));
+        wait_for_task(&mut app);
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old", "skip must not write");
+        assert!(
+            matches!(app.modal, ModalState::ErrorReport { .. }),
+            "a skip is reported, not silently swallowed"
+        );
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn a_conflict_can_be_overwritten() {
+        let (mut app, base) = app_two_panes();
+        let source = base.join("left").join("alpha.txt");
+        let dest = base.join("right").join("alpha.txt");
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(&dest, b"old").unwrap();
+        app.left_panel.refresh().unwrap();
+        app.left_panel.select_path(&source);
+
+        app.handle_key_event(key(KeyCode::F(5)));
+        app.handle_key_event(key(KeyCode::Enter));
+        wait_for_task(&mut app);
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn move_removes_the_source_once_the_copy_is_safe() {
+        let (mut app, base) = app_two_panes();
+        let source = base.join("left").join("beta.txt");
+        let dest = base.join("right").join("beta.txt");
+        std::fs::write(&source, b"carry").unwrap();
+        app.left_panel.refresh().unwrap();
+        app.left_panel.select_path(&source);
+
+        app.handle_key_event(key(KeyCode::F(6)));
+        assert!(matches!(app.modal, ModalState::Confirm { .. }));
+        app.handle_key_event(key(KeyCode::Enter));
+        wait_for_task(&mut app);
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"carry");
+        assert!(!source.exists(), "the source is gone after a move");
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn delete_is_cancellable_and_permanent_once_confirmed() {
+        let (mut app, base) = app_two_panes();
+        let victim = base.join("left").join("gamma.txt");
+        std::fs::write(&victim, b"bye").unwrap();
+        app.left_panel.refresh().unwrap();
+        app.left_panel.select_path(&victim);
+
+        app.handle_key_event(key(KeyCode::F(8)));
+        assert!(matches!(app.modal, ModalState::Confirm { .. }));
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(matches!(app.modal, ModalState::None));
+        assert!(victim.exists(), "escaping must not delete anything");
+
+        app.handle_key_event(key(KeyCode::F(8)));
+        app.handle_key_event(key(KeyCode::Enter));
+        wait_for_task(&mut app);
+
+        assert!(!victim.exists());
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn a_running_task_blocks_a_second_one() {
+        let (mut app, base) = app_two_panes();
+        let source = base.join("left").join("alpha.txt");
+        std::fs::write(&source, b"payload").unwrap();
+        app.left_panel.refresh().unwrap();
+        app.left_panel.select_path(&source);
+
+        app.handle_key_event(key(KeyCode::F(5)));
+        app.handle_key_event(key(KeyCode::Enter));
+
+        // While a task runs the progress dialog traps every key, so a second F5
+        // cannot even reach the planner.
+        app.handle_key_event(key(KeyCode::F(5)));
+        assert!(matches!(app.modal, ModalState::Progress));
+        assert!(app.status_msg.is_none());
+
+        // And if the dialog is out of the way, the guard still refuses.
+        app.modal = ModalState::None;
+        app.begin_transfer(IoOperation::Copy);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("already running"),
+            "got {:?}",
+            app.status_msg
+        );
+        wait_for_task(&mut app);
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn a_large_copy_reports_live_progress_not_a_scan() {
+        let (mut app, base) = app_two_panes();
+        let source = base.join("left").join("big.bin");
+        let dest = base.join("right").join("big.bin");
+        let file = std::fs::File::create(&source).unwrap();
+        file.set_len(96 * 1024 * 1024).unwrap();
+        drop(file);
+
+        app.left_panel.refresh().unwrap();
+        app.left_panel.select_path(&source);
+        app.handle_key_event(key(KeyCode::F(5)));
+        app.handle_key_event(key(KeyCode::Enter));
+
+        // The scan must resolve into a running task within a frame or two:
+        // otherwise the dialog sits on "Measuring the work" for the whole copy.
+        let mut running = false;
+        for _ in 0..500 {
+            app.pump_worker(100);
+            match &app.active_task {
+                Some(task) if task.phase == TaskPhase::Running => {
+                    assert_eq!(task.total_bytes, 96 * 1024 * 1024);
+                    assert_eq!(task.total_items, 1);
+                    running = true;
+                    break;
+                }
+                Some(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                None => break,
+            }
+        }
+        assert!(running, "task never left the scanning phase");
+        wait_for_task(&mut app);
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 96 * 1024 * 1024);
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn nested_selections_collapse_to_their_ancestor() {
+        let base = PathBuf::from("/tmp/fc-dedupe");
+        let picked = dedupe_nested(vec![
+            base.join("a/b/c"),
+            base.join("a"),
+            base.join("d"),
+            base.join("a/b"),
+        ]);
+        assert_eq!(picked, vec![base.join("a"), base.join("d")]);
+    }
+
+    #[test]
+    fn copying_a_directory_into_itself_is_refused_early() {
+        let base = PathBuf::from("/tmp/fc-self");
+        let dir = base.join("sub");
+        let plan = plan_transfer(IoOperation::Copy, vec![dir.clone()], dir.clone());
+        let problems = plan.expect_err("a directory cannot be copied into itself");
+        assert!(
+            problems[0].contains("itself"),
+            "the message should say why: {problems:?}"
+        );
+
+        // The same path as source and destination is equally meaningless.
+        let plan = plan_transfer(IoOperation::Copy, vec![base.join("file.txt")], base.clone());
+        let problems = plan.expect_err("source and destination are identical");
+        assert!(problems[0].contains("same path"), "{problems:?}");
     }
 }

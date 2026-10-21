@@ -11,7 +11,9 @@
 //! terminal wedged, and running the event loop.
 
 mod app;
+mod format;
 mod fs;
+mod tasks;
 mod theme;
 mod ui;
 
@@ -31,6 +33,11 @@ use crate::app::{App, Effect};
 
 /// ~60 FPS: the frame budget, and also the longest the loop sleeps for input.
 const TICK_RATE: Duration = Duration::from_millis(16);
+
+/// Worker messages consumed per frame. Identical to the specification's 100:
+/// enough to keep a progress bar current at 60 FPS, bounded so a worker that
+/// queues thousands of updates cannot starve the renderer.
+const MAX_UPDATES_PER_FRAME: usize = 100;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -135,11 +142,16 @@ impl Drop for TerminalGuard {
 /// Order per iteration is deliberate: draw, then block on input for the
 /// remainder of the frame budget. Drawing first means the worst-case key latency
 /// is one frame, and polling last means an idle app sleeps instead of spinning.
-/// Phase 4 inserts `app.pump_worker(..)` before the draw.
+/// It also owns the worker pump, which must happen before the draw so a frame
+/// never renders state that is one message stale.
 fn run_app(terminal: &mut Tui, app: &mut App, guard: &mut TerminalGuard) -> Result<()> {
     let mut last_tick = Instant::now();
 
     loop {
+        // Drain worker output first: the frame below should show the newest
+        // state that arrived since the previous one.
+        app.pump_worker(MAX_UPDATES_PER_FRAME);
+
         terminal.draw(|frame| ui::render(frame, app))?;
 
         let budget = TICK_RATE.saturating_sub(last_tick.elapsed());

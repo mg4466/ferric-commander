@@ -15,6 +15,9 @@ implementation began.
 
 Rust 1.85+ is required (edition 2024). Tested on rustc 1.99.1.
 
+    cargo test            # 75 tests
+    cargo clippy --all-targets -- -D warnings
+
 ## Keys
 
 | Key         | Action                        |
@@ -28,7 +31,10 @@ Rust 1.85+ is required (edition 2024). Tested on rustc 1.99.1.
 | `a`         | Invert selection              |
 | `F1` / `t`  | Cycle theme                   |
 | `F2` / `s`  | Cycle sort order              |
+| `F5` / `c`  | Copy selection to other pane  |
+| `F6` / `m`  | Move selection to other pane  |
 | `F7` / `r`  | Rename the row under cursor   |
+| `F8` / `d`  | Delete selection              |
 | `F10` / `q` | Quit                          |
 
 On a regular file, `Enter` suspends the TUI and runs `$EDITOR` (falling back to
@@ -38,7 +44,26 @@ directory it navigates; on a dangling symlink it reports on the status line.
 Rename opens a pre-filled prompt; `Enter` applies, `Esc` discards. Renaming onto
 an existing name asks for confirmation instead of silently replacing it.
 
-Copy, move and delete arrive in Phase 4.
+Copy, move and delete run on a worker thread and show a progress dialog.
+
+### Transfers
+
+`F5`/`F6`/`F8` act on the selection, or on the row under the cursor when nothing
+is selected, and always target the other pane's directory. Nothing touches the
+disk before a confirmation:
+
+- No clashes: "Copy 3 items" with `Enter` to proceed.
+- Clashes: the dialog names the conflicting entries (up to three) and offers
+  `Enter` to overwrite or `s` to skip. Overwriting a directory merges into it
+  instead of replacing it.
+- Delete has its own prompt, with no skip option.
+
+While a task runs a dialog shows the current file, item and byte counters and a
+percentage. `Esc` requests cancellation: the dialog changes to "Cancelling…" and
+stays up until the worker acknowledges, which happens within one 64 KiB chunk.
+A cancelled copy deletes its own partial file and leaves every completed item in
+place. Failures on individual items are collected and reported together at the
+end instead of stopping the batch.
 
 ## Layout
 
@@ -48,6 +73,10 @@ Copy, move and delete arrive in Phase 4.
     src/fs/panel.rs    directory listing, sorting, cursor and selection
     src/ui/mod.rs      frame layout: two panes, status line, key bar
     src/ui/panel_view.rs  row rendering
+    src/ui/modal.rs    confirm / input / error / progress dialogs
+    src/tasks/mod.rs   task, update and handle types: the UI/worker contract
+    src/tasks/worker.rs  scan, copy, move, delete, cancellation
+    src/format.rs      shared size and path formatting
 
 ## Status
 
@@ -56,9 +85,11 @@ Copy, move and delete arrive in Phase 4.
 - Phase 2 complete: `Table`-based panes with automatic scroll-into-view, empty
   directory hint, `$EDITOR` launch with suspend/restore.
 - Phase 3 complete: modal system (Confirm, Input, ErrorReport, Progress view),
-  in-place rename with UTF-8-safe editing and overwrite confirmation. 49 tests,
+  in-place rename with UTF-8-safe editing and overwrite confirmation.
+- Phase 4 complete: worker thread with a pre-flight byte/item scan, 64 KiB
+  chunked copies with per-chunk cancellation checks, EXDEV-safe moves, conflict
+  prompts with overwrite/skip, throttled progress, and abort cleanup. 75 tests,
   clippy clean.
-- Phase 4 next: threaded copy/move/delete with progress and cancellation.
 
 ## Design notes worth reading
 
@@ -75,3 +106,15 @@ Copy, move and delete arrive in Phase 4.
 - **The rename cursor counts characters, not bytes**, so editing `café.txt` or
   `🦀.txt` cannot split a code point. `InputState::byte_index` is the single
   place the two representations meet.
+- **The worker never blocks the UI.** It owns an unbounded channel and a
+  `try_recv`-only control channel; the UI drains at most 100 messages per frame,
+  so a task cannot starve rendering even while it reports every 50 ms.
+- **A move deletes each source only after that source's copy succeeded**, and
+  only for the source that just finished — a cross-device move that dies
+  halfway leaves the un-copied sources intact.
+- **Cancellation is cooperative and per chunk.** `Esc` sets a flag; the copy
+  loop checks it every 64 KiB, deletes the half-written destination and reports
+  `Aborted`. Nothing is killed, so no lock or buffer is left inconsistent.
+- **The worker treats a disconnected control channel as a cancel**, so quitting
+  the UI mid-copy stops the writes instead of orphaning a thread that keeps
+  filling the disk.

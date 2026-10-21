@@ -22,12 +22,16 @@ use crate::theme::Theme;
 
 /// Keys advertised in the bottom bar. Grows with each phase so the bar never
 /// promises an action that is not implemented yet.
+/// Deliberately short labels: the bar is one row and the leftmost hints are the
+/// ones a new user needs. Selection keys are omitted because Space is discoverable
+/// from the spec and the row has a hard width budget on an 80-column terminal.
 const KEY_HINTS: &[(&str, &str)] = &[
     ("F1", "Theme"),
     ("F2", "Sort"),
-    ("F7", "Rename"),
-    ("Space", "Select"),
-    ("a", "Invert"),
+    ("F5", "Copy"),
+    ("F6", "Move"),
+    ("F7", "Ren"),
+    ("F8", "Del"),
     ("Tab", "Pane"),
     ("Enter", "Open"),
     ("F10", "Quit"),
@@ -88,7 +92,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let tally = format!(
         "{} selected ({}) / {} items ",
         panel.selected.len(),
-        panel_view::format_size(panel.selected_bytes()),
+        crate::format::format_size(panel.selected_bytes()),
         panel.entries.iter().filter(|e| !e.is_parent_nav).count()
     );
 
@@ -120,7 +124,17 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 /// The F-key hint bar, drawn as one coloured strip.
 fn render_key_bar(frame: &mut Frame, theme: &Theme, area: Rect) {
     let mut spans = Vec::new();
+    let mut used: usize = 0;
+
     for (key, label) in KEY_HINTS {
+        let width = key.chars().count() + label.chars().count() + 3;
+        // Stop before a hint would be cut in half by the frame edge. Clipping
+        // a key name ("F1" shown as "F") is worse than omitting the hint.
+        if used + width > area.width as usize {
+            break;
+        }
+        used += width;
+
         spans.push(Span::styled(
             format!(" {key} "),
             Style::default().bg(theme.fkey_bg).fg(theme.fkey_fg),
@@ -173,17 +187,19 @@ mod tests {
             theme: theme_type.palette(),
             status_msg: None,
             modal: crate::app::ModalState::None,
+            active_task: None,
             should_quit: false,
         }
     }
 
     fn tempdir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
         let path = std::env::temp_dir().join(format!(
-            "fc-ui-test-{tag}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "fc-ui-test-{tag}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
@@ -289,6 +305,7 @@ mod tests {
                 from: dir.join("a"),
                 to: dir.join("other.txt"),
             },
+            allow_skip: false,
         };
 
         let text = render_to_string(&app, 100, 24);
