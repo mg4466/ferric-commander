@@ -8,6 +8,7 @@
 //! `panel_view`, and overlays live in `modal` (Phase 3), so the renderer stays
 //! readable as features are added.
 
+pub mod modal;
 pub mod panel_view;
 
 use ratatui::Frame;
@@ -24,6 +25,7 @@ use crate::theme::Theme;
 const KEY_HINTS: &[(&str, &str)] = &[
     ("F1", "Theme"),
     ("F2", "Sort"),
+    ("F7", "Rename"),
     ("Space", "Select"),
     ("a", "Invert"),
     ("Tab", "Pane"),
@@ -67,6 +69,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_status(frame, app, bands[1]);
     render_key_bar(frame, &theme, bands[2]);
+
+    // Modals paint last so they cover the panes rather than being clipped by
+    // them; they also `Clear` their own rectangle.
+    modal::render(frame, app);
 }
 
 /// Status line: what the app is doing, plus a per-pane tally.
@@ -166,6 +172,7 @@ mod tests {
             theme_type,
             theme: theme_type.palette(),
             status_msg: None,
+            modal: crate::app::ModalState::None,
             should_quit: false,
         }
     }
@@ -250,6 +257,65 @@ mod tests {
         let text = render_to_string(&app, 100, 24);
         assert!(text.contains("* picked.txt"), "selection marker missing");
         assert!(text.contains("1 selected"), "status tally not updated");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn rename_modal_covers_the_panels_and_shows_the_name() {
+        let dir = tempdir("modal-input");
+        std::fs::write(dir.join("note.txt"), b"x").unwrap();
+        let mut app = app_at(dir.clone());
+        app.active_panel_mut().move_down(); // onto note.txt
+        app.handle_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(7),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        let text = render_to_string(&app, 100, 24);
+        assert!(text.contains("Rename"), "modal title missing");
+        assert!(text.contains("note.txt"), "prefilled name missing");
+        assert!(text.contains("apply"), "footer hint missing");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn confirm_modal_states_that_the_action_is_permanent() {
+        let dir = tempdir("modal-confirm");
+        let mut app = app_at(dir.clone());
+        app.modal = crate::app::ModalState::Confirm {
+            title: "Overwrite?".into(),
+            prompt: "other.txt already exists.".into(),
+            action: crate::app::ConfirmAction::RenameOverwrite {
+                from: dir.join("a"),
+                to: dir.join("other.txt"),
+            },
+        };
+
+        let text = render_to_string(&app, 100, 24);
+        assert!(text.contains("Overwrite?"));
+        assert!(text.contains("cannot be undone"));
+        assert!(text.contains("confirm"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn error_report_shows_every_message() {
+        let dir = tempdir("modal-error");
+        let mut app = app_at(dir.clone());
+        app.modal = crate::app::ModalState::ErrorReport {
+            title: "Rename failed".into(),
+            errors: vec![
+                "first: permission denied".into(),
+                "second: no space left".into(),
+            ],
+            scroll_offset: 0,
+        };
+
+        let text = render_to_string(&app, 100, 24);
+        assert!(text.contains("Rename failed"));
+        assert!(text.contains("first: permission denied"));
+        assert!(text.contains("second: no space left"));
+        assert!(text.contains("dismiss"));
         std::fs::remove_dir_all(dir).ok();
     }
 

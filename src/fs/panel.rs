@@ -366,6 +366,14 @@ impl PanelState {
             .sum()
     }
 
+    /// Move the cursor onto `path` if the listing contains it.
+    ///
+    /// Used after a rename: the old name is gone, so the cursor would otherwise
+    /// land wherever the clamped index happens to point.
+    pub fn select_path(&mut self, path: &Path) {
+        self.focus_path(Some(path));
+    }
+
     /// Drop selection entries whose files no longer exist in the listing.
     fn retain_valid_selection(&mut self) {
         self.selected

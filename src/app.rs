@@ -11,7 +11,8 @@
 //! `keymap.conf`; the dispatch structure below is already shaped for that split,
 //! since every arm calls a small named method instead of doing work inline.
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -29,6 +30,127 @@ use crate::theme::{Theme, ThemeType};
 pub enum Effect {
     /// Suspend the TUI, run `$EDITOR` on this path, then resume and refresh.
     OpenInEditor(PathBuf),
+}
+
+/// The text buffer of an in-place rename prompt.
+///
+/// `cursor_pos` is a *character* index, not a byte offset: filenames are UTF-8
+/// and moving a byte cursor would split multibyte characters. Every mutation
+/// converts at the boundary via `byte_index`, which is the only place the two
+/// representations meet.
+#[derive(Debug, Clone)]
+pub struct InputState {
+    pub buffer: String,
+    pub cursor_pos: usize,
+}
+
+impl InputState {
+    /// Seed the buffer with `prefill` and put the cursor at the end, so typing
+    /// appends to the existing name rather than replacing it.
+    pub fn new(prefill: impl Into<String>) -> Self {
+        let buffer = prefill.into();
+        let cursor_pos = buffer.chars().count();
+        Self { buffer, cursor_pos }
+    }
+
+    /// Insert one character at the cursor and step past it.
+    pub fn insert(&mut self, c: char) {
+        let at = self.byte_index();
+        self.buffer.insert(at, c);
+        self.cursor_pos += 1;
+    }
+
+    /// Remove the character before the cursor. A no-op at position 0.
+    pub fn backspace(&mut self) {
+        if self.cursor_pos == 0 {
+            return;
+        }
+        let end = self.byte_index();
+        let start = self.buffer[..end]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        self.buffer.replace_range(start..end, "");
+        self.cursor_pos -= 1;
+    }
+
+    pub fn left(&mut self) {
+        self.cursor_pos = self.cursor_pos.saturating_sub(1);
+    }
+
+    pub fn right(&mut self) {
+        self.cursor_pos = (self.cursor_pos + 1).min(self.buffer.chars().count());
+    }
+
+    pub fn home(&mut self) {
+        self.cursor_pos = 0;
+    }
+
+    pub fn end(&mut self) {
+        self.cursor_pos = self.buffer.chars().count();
+    }
+
+    /// Byte offset of the cursor, clamped to the end of the buffer.
+    fn byte_index(&self) -> usize {
+        self.buffer
+            .char_indices()
+            .nth(self.cursor_pos)
+            .map(|(index, _)| index)
+            .unwrap_or(self.buffer.len())
+    }
+}
+
+/// What an [`ModalState::Input`] dialog will do with the typed text.
+#[derive(Debug, Clone)]
+pub enum InputAction {
+    RenameSingle(PathBuf),
+}
+
+/// What an [`ModalState::Confirm`] dialog will do if accepted.
+///
+/// Phase 4 adds the copy/move/delete variants, each carrying a `FileTask`, and
+/// the accept path dispatches on this instead of on a loosely-typed task field.
+#[derive(Debug, Clone)]
+pub enum ConfirmAction {
+    /// The rename destination already exists; overwriting was acknowledged.
+    RenameOverwrite { from: PathBuf, to: PathBuf },
+}
+
+/// A modal dialog, or the absence of one.
+///
+/// Modals are exclusive: while one is open it traps every key press. That is
+/// what stops a stray `q` from quitting mid-rename, or a `d` from deleting a
+/// file the user was only trying to name.
+#[derive(Debug)]
+pub enum ModalState {
+    None,
+    Confirm {
+        title: String,
+        prompt: String,
+        action: ConfirmAction,
+    },
+    Input {
+        title: String,
+        input: InputState,
+        pending_op: InputAction,
+    },
+    /// Rendered from the active task's handle. Unreachable until Phase 4 wires
+    /// the worker up, but the view is written now so the layout is settled.
+    #[allow(dead_code)]
+    Progress,
+    ErrorReport {
+        title: String,
+        errors: Vec<String>,
+        scroll_offset: u16,
+    },
+}
+
+impl ModalState {
+    /// True when the app is idle, i.e. panel keys are live.
+    pub fn is_none(&self) -> bool {
+        matches!(self, ModalState::None)
+    }
 }
 
 /// Which pane receives navigation keys.
@@ -57,9 +179,10 @@ pub struct App {
     /// Resolved colours for `theme_type`. Kept in sync by `cycle_theme` so the
     /// renderer never has to re-resolve a palette per widget.
     pub theme: Theme,
-    /// Transient one-line message (an error, or a confirmation of what just
-    /// happened). Phase 3 routes hard errors to a modal instead.
+    /// Transient one-line message (success notices, hints). Hard failures go
+    /// to `modal` as an `ErrorReport` so they cannot scroll away unseen.
     pub status_msg: Option<String>,
+    pub modal: ModalState,
     pub should_quit: bool,
 }
 
@@ -79,6 +202,7 @@ impl App {
             theme_type,
             theme: theme_type.palette(),
             status_msg: None,
+            modal: ModalState::None,
             should_quit: false,
         })
     }
@@ -160,6 +284,19 @@ impl App {
             return None;
         }
 
+        // Modals trap everything. Nothing below this line runs while one is
+        // open, which is the invariant that keeps destructive keys from firing
+        // at a half-typed filename.
+        if !self.modal.is_none() {
+            self.handle_modal_key(key);
+            return None;
+        }
+
+        self.handle_panel_key(key)
+    }
+
+    /// Panel-level (non-modal) key handling.
+    fn handle_panel_key(&mut self, key: KeyEvent) -> Option<Effect> {
         match key.code {
             KeyCode::Char('q') | KeyCode::F(10) => {
                 self.should_quit = true;
@@ -194,6 +331,11 @@ impl App {
             }
             KeyCode::Char('a') => {
                 self.active_panel_mut().invert_selection();
+                None
+            }
+
+            KeyCode::F(7) | KeyCode::Char('r') => {
+                self.open_rename_prompt();
                 None
             }
 
@@ -259,7 +401,7 @@ impl App {
     fn enter_directory(&mut self) {
         self.clear_status();
         if let Err(err) = self.active_panel_mut().enter_directory() {
-            self.set_error(err);
+            self.report_error("Cannot open directory", err);
         }
     }
 
@@ -267,9 +409,253 @@ impl App {
     fn go_parent(&mut self) {
         self.clear_status();
         if let Err(err) = self.active_panel_mut().go_parent() {
-            self.set_error(err);
+            self.report_error("Cannot open directory", err);
         }
     }
+
+    // ---------------------------------------------------------------- modals
+
+    /// Route a key press while a modal is open.
+    ///
+    /// The outcome is computed inside the borrow of `self.modal` and acted on
+    /// afterwards, because the actions themselves need `&mut self` (they close
+    /// modals and touch the filesystem). Returning an enum instead of calling
+    /// methods inline is what keeps this to one borrow.
+    fn handle_modal_key(&mut self, key: KeyEvent) {
+        let outcome = match &mut self.modal {
+            ModalState::None => ModalOutcome::Ignore,
+
+            ModalState::Input { input, .. } => match key.code {
+                KeyCode::Esc => ModalOutcome::Cancel,
+                KeyCode::Enter => ModalOutcome::SubmitInput,
+                KeyCode::Backspace => {
+                    input.backspace();
+                    ModalOutcome::Ignore
+                }
+                KeyCode::Left => {
+                    input.left();
+                    ModalOutcome::Ignore
+                }
+                KeyCode::Right => {
+                    input.right();
+                    ModalOutcome::Ignore
+                }
+                KeyCode::Home => {
+                    input.home();
+                    ModalOutcome::Ignore
+                }
+                KeyCode::End => {
+                    input.end();
+                    ModalOutcome::Ignore
+                }
+                // Control chords are reserved (Ctrl+C already quit above);
+                // inserting their characters would be surprising.
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    input.insert(c);
+                    ModalOutcome::Ignore
+                }
+                _ => ModalOutcome::Ignore,
+            },
+
+            ModalState::Confirm { .. } => match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    ModalOutcome::AcceptConfirm
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => ModalOutcome::Cancel,
+                _ => ModalOutcome::Ignore,
+            },
+
+            ModalState::ErrorReport {
+                errors,
+                scroll_offset,
+                ..
+            } => {
+                let max = errors.len().saturating_sub(1) as u16;
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => ModalOutcome::Cancel,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *scroll_offset = scroll_offset.saturating_sub(1);
+                        ModalOutcome::Ignore
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *scroll_offset = (*scroll_offset + 1).min(max);
+                        ModalOutcome::Ignore
+                    }
+                    KeyCode::PageUp => {
+                        *scroll_offset = scroll_offset.saturating_sub(10);
+                        ModalOutcome::Ignore
+                    }
+                    KeyCode::PageDown => {
+                        *scroll_offset = (*scroll_offset + 10).min(max);
+                        ModalOutcome::Ignore
+                    }
+                    _ => ModalOutcome::Ignore,
+                }
+            }
+
+            // Phase 4 turns Esc here into a WorkerControl::Cancel.
+            ModalState::Progress => ModalOutcome::Ignore,
+        };
+
+        match outcome {
+            ModalOutcome::Ignore => {}
+            ModalOutcome::Cancel => {
+                self.modal = ModalState::None;
+                self.status_msg = Some("Cancelled.".to_string());
+            }
+            ModalOutcome::SubmitInput => self.submit_input(),
+            ModalOutcome::AcceptConfirm => self.accept_confirm(),
+        }
+    }
+
+    /// Open the rename prompt pre-filled with the cursor entry's name.
+    fn open_rename_prompt(&mut self) {
+        let Some(entry) = self.active_panel().selected_entry() else {
+            return;
+        };
+        if entry.is_parent_nav {
+            self.status_msg = Some("Cannot rename \"..\"".to_string());
+            return;
+        }
+
+        let path = entry.path.clone();
+        let name = entry.name.clone();
+        self.clear_status();
+        self.modal = ModalState::Input {
+            title: format!("Rename  {}", path.display()),
+            input: InputState::new(name),
+            pending_op: InputAction::RenameSingle(path),
+        };
+    }
+
+    /// Act on a submitted rename prompt.
+    fn submit_input(&mut self) {
+        // Take the modal out so `self` is free for the filesystem work below.
+        // If the variant is not `Input` (impossible via the routing above) the
+        // modal stays closed rather than half-open.
+        let ModalState::Input {
+            input, pending_op, ..
+        } = std::mem::replace(&mut self.modal, ModalState::None)
+        else {
+            return;
+        };
+
+        let InputAction::RenameSingle(from) = pending_op;
+        let to = match valid_rename_target(&from, &input.buffer) {
+            Ok(to) => to,
+            Err(message) => {
+                self.show_error("Invalid name", vec![message]);
+                return;
+            }
+        };
+
+        if to == from {
+            self.status_msg = Some("Name unchanged.".to_string());
+            return;
+        }
+
+        // `symlink_metadata` rather than `exists`: a dangling symlink still
+        // occupies the name, and `exists` would report false and let rename
+        // silently replace it.
+        if fs::symlink_metadata(&to).is_ok() {
+            self.modal = ModalState::Confirm {
+                title: "Overwrite?".to_string(),
+                prompt: format!(
+                    "{} already exists.\nOverwriting replaces it permanently.",
+                    to.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| to.display().to_string())
+                ),
+                action: ConfirmAction::RenameOverwrite { from, to },
+            };
+            return;
+        }
+
+        self.perform_rename(from, to);
+    }
+
+    /// Accept the currently open confirm dialog.
+    fn accept_confirm(&mut self) {
+        let ModalState::Confirm { action, .. } =
+            std::mem::replace(&mut self.modal, ModalState::None)
+        else {
+            return;
+        };
+
+        match action {
+            ConfirmAction::RenameOverwrite { from, to } => self.perform_rename(from, to),
+        }
+    }
+
+    /// Rename on disk, then resynchronise the panes with reality.
+    fn perform_rename(&mut self, from: PathBuf, to: PathBuf) {
+        match fs::rename(&from, &to) {
+            Ok(()) => {
+                self.refresh_both_panels();
+                self.active_panel_mut().select_path(&to);
+                let name = to
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| to.display().to_string());
+                self.status_msg = Some(format!("Renamed to {name}"));
+            }
+            Err(err) => {
+                self.show_error(
+                    "Rename failed",
+                    vec![format!("{} -> {}: {err}", from.display(), to.display())],
+                );
+            }
+        }
+    }
+
+    /// Surface a filesystem failure as an error report the user has to dismiss.
+    fn report_error(&mut self, title: &str, err: anyhow::Error) {
+        self.show_error(title, vec![format!("{err:#}")]);
+    }
+
+    /// Open (or replace) the error report modal.
+    fn show_error(&mut self, title: &str, errors: Vec<String>) {
+        self.status_msg = None;
+        self.modal = ModalState::ErrorReport {
+            title: title.to_string(),
+            errors,
+            scroll_offset: 0,
+        };
+    }
+}
+
+/// What a key press inside a modal asked for, resolved after the borrow ends.
+enum ModalOutcome {
+    Ignore,
+    Cancel,
+    SubmitInput,
+    AcceptConfirm,
+}
+
+/// Validate a typed name and resolve it against the source file's directory.
+///
+/// Returns an error message fit for display rather than an `io::Error`, because
+/// the failure is the user's input, not the filesystem's. `\0` and `/` are
+/// rejected rather than passed through: both produce `EINVAL`/`ENOENT` from the
+/// kernel at best, and `/` would quietly turn "rename" into "move elsewhere".
+fn valid_rename_target(from: &Path, raw: &str) -> Result<PathBuf, String> {
+    if raw.is_empty() {
+        return Err("A name is required.".to_string());
+    }
+    if raw == "." || raw == ".." {
+        return Err(format!(
+            "\"{raw}\" is reserved and cannot be used as a name."
+        ));
+    }
+    if raw.contains('/') {
+        return Err("A name cannot contain '/'.".to_string());
+    }
+    if raw.contains('\0') {
+        return Err("A name cannot contain a NUL byte.".to_string());
+    }
+
+    let parent = from.parent().unwrap_or_else(|| Path::new("."));
+    Ok(parent.join(raw))
 }
 
 #[cfg(test)]
@@ -301,6 +687,7 @@ mod tests {
             theme_type,
             theme: theme_type.palette(),
             status_msg: None,
+            modal: ModalState::None,
             should_quit: false,
         };
         (app, path)
@@ -439,6 +826,246 @@ mod tests {
         assert!(!app.should_quit);
         assert_eq!(app.active_pane, ActivePane::Left);
         assert!(app.status_msg.is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ---------------------------------------------------------- modals & rename
+
+    /// Read the rename buffer, or panic with the modal that is actually open.
+    fn buffer(app: &App) -> &str {
+        match &app.modal {
+            ModalState::Input { input, .. } => &input.buffer,
+            other => panic!("expected an Input modal, got {other:?}"),
+        }
+    }
+
+    fn type_str(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key_event(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn backspace_n(app: &mut App, count: usize) {
+        for _ in 0..count {
+            app.handle_key_event(key(KeyCode::Backspace));
+        }
+    }
+
+    #[test]
+    fn f7_opens_a_prompt_prefilled_with_the_current_name() {
+        let (mut app, dir) = app_at_tempdir();
+        focus(&mut app, "file.txt");
+
+        app.handle_key_event(key(KeyCode::F(7)));
+        assert_eq!(buffer(&app), "file.txt");
+
+        // Cursor sits at the end, so typing appends.
+        type_str(&mut app, "_v2");
+        assert_eq!(buffer(&app), "file.txt_v2");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn enter_renames_on_disk_and_moves_the_cursor() {
+        let (mut app, dir) = app_at_tempdir();
+        focus(&mut app, "file.txt");
+
+        app.handle_key_event(key(KeyCode::Char('r')));
+        type_str(&mut app, "_v2");
+        app.handle_key_event(key(KeyCode::Enter));
+
+        assert!(app.modal.is_none(), "modal should close after a rename");
+        assert!(!dir.join("file.txt").exists());
+        assert!(dir.join("file.txt_v2").exists());
+
+        assert_eq!(
+            app.active_panel().selected_entry().map(|e| e.name.as_str()),
+            Some("file.txt_v2")
+        );
+        assert!(app.status_msg.as_deref().unwrap_or("").contains("Renamed"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn esc_discards_the_rename() {
+        let (mut app, dir) = app_at_tempdir();
+        focus(&mut app, "file.txt");
+
+        app.handle_key_event(key(KeyCode::F(7)));
+        type_str(&mut app, "_discarded");
+        app.handle_key_event(key(KeyCode::Esc));
+
+        assert!(app.modal.is_none());
+        assert!(dir.join("file.txt").exists());
+        assert!(!dir.join("file.txt_discarded").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn renaming_onto_an_existing_name_requires_confirmation() {
+        let (mut app, dir) = app_at_tempdir();
+        std::fs::write(dir.join("other.txt"), b"original").unwrap();
+        app.refresh_both_panels();
+        focus(&mut app, "file.txt");
+
+        app.handle_key_event(key(KeyCode::F(7)));
+        // Clear "file.txt" (8 chars) and type the taken name.
+        backspace_n(&mut app, "file.txt".chars().count());
+        type_str(&mut app, "other.txt");
+        app.handle_key_event(key(KeyCode::Enter));
+
+        match &app.modal {
+            ModalState::Confirm { prompt, .. } => {
+                assert!(prompt.contains("other.txt"), "prompt was {prompt:?}");
+            }
+            other => panic!("expected a Confirm modal, got {other:?}"),
+        }
+        // Nothing has happened yet: confirmation is not a formality.
+        assert!(dir.join("file.txt").exists());
+        assert_eq!(std::fs::read(dir.join("other.txt")).unwrap(), b"original");
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.modal.is_none());
+        assert!(!dir.join("file.txt").exists());
+        // app_at_tempdir writes file.txt with exactly the byte b"x".
+        assert_eq!(std::fs::read(dir.join("other.txt")).unwrap(), b"x");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn cancelling_the_overwrite_confirmation_leaves_both_files_alone() {
+        let (mut app, dir) = app_at_tempdir();
+        std::fs::write(dir.join("other.txt"), b"original").unwrap();
+        app.refresh_both_panels();
+        focus(&mut app, "file.txt");
+
+        app.handle_key_event(key(KeyCode::F(7)));
+        backspace_n(&mut app, "file.txt".chars().count());
+        type_str(&mut app, "other.txt");
+        app.handle_key_event(key(KeyCode::Enter));
+        app.handle_key_event(key(KeyCode::Esc));
+
+        assert!(app.modal.is_none());
+        assert!(dir.join("file.txt").exists());
+        assert_eq!(std::fs::read(dir.join("other.txt")).unwrap(), b"original");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invalid_names_are_rejected_by_the_pure_validator() {
+        let from = Path::new("/tmp/x/file.txt");
+
+        assert!(valid_rename_target(from, "").is_err());
+        assert!(valid_rename_target(from, ".").is_err());
+        assert!(valid_rename_target(from, "..").is_err());
+        assert!(valid_rename_target(from, "a/b").is_err());
+        assert!(valid_rename_target(from, "a\0b").is_err());
+
+        assert_eq!(
+            valid_rename_target(from, "new name.txt").unwrap(),
+            Path::new("/tmp/x/new name.txt")
+        );
+        // A name that merely contains dots is fine.
+        assert!(valid_rename_target(from, "...").is_ok());
+        assert!(valid_rename_target(from, ".hidden").is_ok());
+    }
+
+    #[test]
+    fn invalid_rename_opens_an_error_report_instead_of_touching_disk() {
+        let (mut app, dir) = app_at_tempdir();
+        focus(&mut app, "file.txt");
+
+        app.handle_key_event(key(KeyCode::F(7)));
+        backspace_n(&mut app, 8);
+        type_str(&mut app, "a/b");
+        app.handle_key_event(key(KeyCode::Enter));
+
+        match &app.modal {
+            ModalState::ErrorReport { title, errors, .. } => {
+                assert_eq!(title, "Invalid name");
+                assert!(errors[0].contains("'/'"), "errors were {errors:?}");
+            }
+            other => panic!("expected an ErrorReport, got {other:?}"),
+        }
+        assert!(dir.join("file.txt").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn keys_are_trapped_while_a_modal_is_open() {
+        let (mut app, dir) = app_at_tempdir();
+        focus(&mut app, "file.txt");
+        app.handle_key_event(key(KeyCode::F(7)));
+
+        // 'q' would quit from panel mode; here it must be text.
+        app.handle_key_event(key(KeyCode::Char('q')));
+        assert!(!app.should_quit);
+        assert!(buffer(&app).ends_with('q'));
+
+        // Tab must not switch panes either.
+        app.handle_key_event(key(KeyCode::Tab));
+        assert_eq!(app.active_pane, ActivePane::Left);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn multibyte_names_survive_editing() {
+        let (mut app, dir) = app_at_tempdir();
+        std::fs::write(dir.join("café.txt"), b"x").unwrap();
+        app.refresh_both_panels();
+        focus(&mut app, "café.txt");
+
+        app.handle_key_event(key(KeyCode::F(7)));
+        backspace_n(&mut app, "café.txt".chars().count());
+        type_str(&mut app, "🦀.txt");
+        app.handle_key_event(key(KeyCode::Enter));
+
+        assert!(dir.join("🦀.txt").exists(), "multibyte rename failed");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn input_state_edits_by_character_not_byte() {
+        let mut input = InputState::new("héllo");
+        assert_eq!(input.cursor_pos, 5, "cursor counted in chars");
+
+        // Step over 'h' and 'é', then delete backwards: a byte-indexed
+        // implementation would cut the middle out of 'é' and produce invalid
+        // UTF-8 here.
+        input.home();
+        input.right();
+        input.right();
+        input.backspace();
+        assert_eq!(input.buffer, "hllo");
+        assert_eq!(input.cursor_pos, 1);
+
+        input.insert('é');
+        assert_eq!(input.buffer, "héllo");
+
+        input.end();
+        input.right(); // clamped at the end
+        assert_eq!(input.cursor_pos, 5);
+    }
+
+    #[test]
+    fn failed_directory_entry_opens_an_error_report() {
+        let (mut app, dir) = app_at_tempdir();
+        std::fs::create_dir(dir.join("vanishing")).unwrap();
+        app.refresh_both_panels();
+        focus(&mut app, "vanishing");
+
+        // The directory is gone between listing and entry.
+        std::fs::remove_dir(dir.join("vanishing")).unwrap();
+        app.handle_key_event(key(KeyCode::Enter));
+
+        match &app.modal {
+            ModalState::ErrorReport { title, .. } => assert_eq!(title, "Cannot open directory"),
+            other => panic!("expected an ErrorReport, got {other:?}"),
+        }
+        // Esc dismisses and the pane is still usable.
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert_eq!(app.active_panel().cwd, dir);
         std::fs::remove_dir_all(dir).ok();
     }
 }

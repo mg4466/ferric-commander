@@ -28,13 +28,17 @@ Rust 1.85+ is required (edition 2024). Tested on rustc 1.99.1.
 | `a`         | Invert selection              |
 | `F1` / `t`  | Cycle theme                   |
 | `F2` / `s`  | Cycle sort order              |
+| `F7` / `r`  | Rename the row under cursor   |
 | `F10` / `q` | Quit                          |
 
 On a regular file, `Enter` suspends the TUI and runs `$EDITOR` (falling back to
 `$VISUAL`, then `vi`), then restores the screen and re-reads both panes. On a
 directory it navigates; on a dangling symlink it reports on the status line.
 
-Copy, move, rename and delete arrive in Phases 3 and 4.
+Rename opens a pre-filled prompt; `Enter` applies, `Esc` discards. Renaming onto
+an existing name asks for confirmation instead of silently replacing it.
+
+Copy, move and delete arrive in Phase 4.
 
 ## Layout
 
@@ -50,9 +54,11 @@ Copy, move, rename and delete arrive in Phases 3 and 4.
 - Phase 1 complete: terminal bootstrap, themes, synchronous filesystem engine,
   navigation, sorting, selection.
 - Phase 2 complete: `Table`-based panes with automatic scroll-into-view, empty
-  directory hint, `$EDITOR` launch with suspend/restore. 30 tests, clippy clean.
-- Phase 3 next: modal system (Confirm, Input, ErrorReport), in-place rename.
-- Phase 4: threaded copy/move/delete with progress and cancellation.
+  directory hint, `$EDITOR` launch with suspend/restore.
+- Phase 3 complete: modal system (Confirm, Input, ErrorReport, Progress view),
+  in-place rename with UTF-8-safe editing and overwrite confirmation. 49 tests,
+  clippy clean.
+- Phase 4 next: threaded copy/move/delete with progress and cancellation.
 
 ## Design notes worth reading
 
@@ -64,3 +70,8 @@ Copy, move, rename and delete arrive in Phases 3 and 4.
 - **Failures never move the cursor's directory.** A pane lists the target
   before committing `cwd`, so entering an unreadable directory returns an error
   and leaves the pane usable.
+- **Modals trap every key.** A `q` typed into a rename prompt is a `q`, not a
+  quit; the routing branches before anything else looks at the key.
+- **The rename cursor counts characters, not bytes**, so editing `café.txt` or
+  `🦀.txt` cannot split a code point. `InputState::byte_index` is the single
+  place the two representations meet.

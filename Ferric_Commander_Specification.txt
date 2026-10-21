@@ -521,6 +521,13 @@ Goal: Implement background Copy (F5), Move (F6), and Delete (F8) with live progr
    * Section 4: added Destination Conflict, Self-Containment Check Path and
      Cancelled Mid-File rows.
    * Section 5: Enter-on-file behaviour specified.
+   * Section 2: ModalState::Confirm carries a ConfirmAction enum rather than
+     pending_task: FileTask. Rename is not a FileTask operation, and a single
+     loosely-typed task field would have to mean two different things; Phase 4
+     adds Copy/Move/Delete variants that do carry a FileTask.
+   * Section 2: ModalState::Input groups the buffer and cursor into InputState,
+     so the editing rules (character-indexed cursor, UTF-8 safe) live with the
+     data they operate on instead of being loose fields on the modal.
 
 7.3 Phase 7 (post-1.0) - Configurable keybindings
 
