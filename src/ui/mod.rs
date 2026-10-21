@@ -1,0 +1,239 @@
+//! Frame composition: two panes, a status line and an F-key bar.
+//!
+//! Layout is three vertical bands — body (grows), status (1 row), keys (1 row) —
+//! and the body splits 50/50 horizontally. Percentages are used for the split so
+//! that an odd column count cannot leave a one-column gap between the panes.
+//!
+//! This module only decides *where* things go. What a pane looks like lives in
+//! `panel_view`, and overlays live in `modal` (Phase 3), so the renderer stays
+//! readable as features are added.
+
+pub mod panel_view;
+
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+
+use crate::app::{ActivePane, App};
+use crate::theme::Theme;
+
+/// Keys advertised in the bottom bar. Grows with each phase so the bar never
+/// promises an action that is not implemented yet.
+const KEY_HINTS: &[(&str, &str)] = &[
+    ("F1", "Theme"),
+    ("F2", "Sort"),
+    ("Space", "Select"),
+    ("a", "Invert"),
+    ("Tab", "Pane"),
+    ("Enter", "Open"),
+    ("F10", "Quit"),
+];
+
+/// Draw one complete frame.
+pub fn render(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let theme = app.theme;
+
+    let bands = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(bands[0]);
+
+    panel_view::render(
+        frame,
+        &app.left_panel,
+        panes[0],
+        app.active_pane == ActivePane::Left,
+        &theme,
+    );
+    panel_view::render(
+        frame,
+        &app.right_panel,
+        panes[1],
+        app.active_pane == ActivePane::Right,
+        &theme,
+    );
+
+    render_status(frame, app, bands[1]);
+    render_key_bar(frame, &theme, bands[2]);
+}
+
+/// Status line: what the app is doing, plus a per-pane tally.
+fn render_status(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
+    let panel = app.active_panel();
+
+    let message = match &app.status_msg {
+        Some(msg) => Span::styled(msg.clone(), Style::default().fg(theme.error_fg)),
+        None => Span::styled("Ready.", Style::default().fg(theme.border_inactive)),
+    };
+
+    let tally = format!(
+        "{} selected ({}) / {} items ",
+        panel.selected.len(),
+        panel_view::format_size(panel.selected_bytes()),
+        panel.entries.iter().filter(|e| !e.is_parent_nav).count()
+    );
+
+    let line = Line::from(vec![
+        Span::styled(
+            format!("[{}] ", theme.name),
+            Style::default().fg(theme.dir_fg),
+        ),
+        message,
+    ]);
+
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(theme.bg)),
+        area,
+    );
+
+    // Right-aligned tally. Drawn separately so a long error message on the left
+    // cannot push it off screen.
+    let right = Paragraph::new(Line::from(Span::styled(
+        tally,
+        Style::default().fg(theme.border_inactive),
+    )))
+    .alignment(ratatui::layout::Alignment::Right)
+    .style(Style::default().bg(theme.bg));
+
+    frame.render_widget(right, area);
+}
+
+/// The F-key hint bar, drawn as one coloured strip.
+fn render_key_bar(frame: &mut Frame, theme: &Theme, area: Rect) {
+    let mut spans = Vec::new();
+    for (key, label) in KEY_HINTS {
+        spans.push(Span::styled(
+            format!(" {key} "),
+            Style::default().bg(theme.fkey_bg).fg(theme.fkey_fg),
+        ));
+        spans.push(Span::styled(
+            format!("{label} "),
+            Style::default().bg(theme.fkey_bg).fg(theme.fg),
+        ));
+    }
+
+    let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.fkey_bg));
+    frame.render_widget(bar, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::panel::PanelState;
+    use crate::theme::ThemeType;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::path::PathBuf;
+
+    /// Render one frame into an 80x24 offscreen buffer and return its text.
+    ///
+    /// This is the cheapest honest check that layout, which is pure geometry,
+    /// actually puts pixels where we think: no terminal required.
+    fn render_to_string(app: &App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, app))
+            .expect("draw frame");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn app_at(dir: PathBuf) -> App {
+        let theme_type = ThemeType::CatppuccinMocha;
+        App {
+            left_panel: PanelState::new(dir.clone()).expect("left panel"),
+            right_panel: PanelState::new(dir).expect("right panel"),
+            active_pane: ActivePane::Left,
+            theme_type,
+            theme: theme_type.palette(),
+            status_msg: None,
+            should_quit: false,
+        }
+    }
+
+    fn tempdir(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "fc-ui-test-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn frame_contains_both_panes_status_and_key_bar() {
+        let dir = tempdir("frame");
+        std::fs::write(dir.join("visible-file.txt"), b"hello").unwrap();
+        let app = app_at(dir.clone());
+
+        let text = render_to_string(&app, 100, 24);
+
+        assert!(text.contains("visible-file.txt"), "file row missing");
+        // Two panes, so the status/footer text appears twice for the cwd.
+        assert_eq!(text.matches("Catppuccin Mocha").count(), 1);
+        assert!(text.contains("F10"), "key bar missing");
+        assert!(text.contains("Quit"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn long_listings_scroll_the_cursor_into_view() {
+        let dir = tempdir("scroll");
+        for i in 0..60 {
+            std::fs::write(dir.join(format!("file-{i:02}.txt")), b"x").unwrap();
+        }
+        let mut app = app_at(dir.clone());
+        // Give the right pane an empty directory: otherwise it mirrors the same
+        // listing at cursor 0 and the "top scrolled away" check below could
+        // never pass, since it would find file-00.txt in the other pane.
+        app.right_panel = PanelState::new(tempdir("scroll-empty")).unwrap();
+        // Walk to the very last row (".." + 60 files means index 60).
+        while app.active_panel().cursor().unwrap() < app.active_panel().entries.len() - 1 {
+            app.active_panel_mut().move_down();
+        }
+
+        let text = render_to_string(&app, 100, 24);
+        assert!(
+            text.contains("file-59.txt"),
+            "cursor row not scrolled into view"
+        );
+        assert!(
+            !text.contains("file-00.txt"),
+            "the top of the listing should have scrolled away"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn narrow_terminal_does_not_panic() {
+        // Degenerate sizes are where layout code divides by zero.
+        let dir = tempdir("narrow");
+        let app = app_at(dir.clone());
+        for (w, h) in [(1, 1), (10, 3), (20, 5), (200, 60)] {
+            let _ = render_to_string(&app, w, h);
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
