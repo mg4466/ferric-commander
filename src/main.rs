@@ -16,6 +16,8 @@ mod theme;
 mod ui;
 
 use std::io::{self, Stdout};
+use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -25,7 +27,7 @@ use crossterm::{cursor, execute};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::App;
+use crate::app::{App, Effect};
 
 /// ~60 FPS: the frame budget, and also the longest the loop sleeps for input.
 const TICK_RATE: Duration = Duration::from_millis(16);
@@ -42,7 +44,7 @@ fn main() -> Result<()> {
     terminal.clear()?;
 
     let mut app = App::new()?;
-    let result = run_app(&mut terminal, &mut app);
+    let result = run_app(&mut terminal, &mut app, &mut guard);
 
     // Restore before returning so `anyhow`'s error report is printed on a normal
     // screen rather than into the alternate buffer, where it would vanish.
@@ -119,7 +121,12 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = Self::leave();
+        // Only if we still hold the terminal: after `suspend` the shell owns it
+        // again, and emitting a second LeaveAlternateScreen there is a no-op on
+        // most terminals but noise on some.
+        if self.active {
+            let _ = Self::leave();
+        }
     }
 }
 
@@ -129,7 +136,7 @@ impl Drop for TerminalGuard {
 /// remainder of the frame budget. Drawing first means the worst-case key latency
 /// is one frame, and polling last means an idle app sleeps instead of spinning.
 /// Phase 4 inserts `app.pump_worker(..)` before the draw.
-fn run_app(terminal: &mut Tui, app: &mut App) -> Result<()> {
+fn run_app(terminal: &mut Tui, app: &mut App, guard: &mut TerminalGuard) -> Result<()> {
     let mut last_tick = Instant::now();
 
     loop {
@@ -143,7 +150,11 @@ fn run_app(terminal: &mut Tui, app: &mut App) -> Result<()> {
             if let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
-                app.handle_key_event(key);
+                // Key handling itself never touches the terminal; anything that
+                // needs the screen comes back as an `Effect` to run here.
+                if let Some(effect) = app.handle_key_event(key) {
+                    apply_effect(guard, terminal, app, effect)?;
+                }
             }
             // Resize needs no handling: ratatui observes the new area on the
             // next `draw`, because the backend resizes the buffer every frame.
@@ -159,4 +170,126 @@ fn run_app(terminal: &mut Tui, app: &mut App) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Execute an effect the app could not carry out itself.
+fn apply_effect(
+    guard: &mut TerminalGuard,
+    terminal: &mut Tui,
+    app: &mut App,
+    effect: Effect,
+) -> Result<()> {
+    match effect {
+        Effect::OpenInEditor(path) => open_in_editor(guard, terminal, app, &path),
+    }
+}
+
+/// Resolve the editor to run: `$EDITOR`, then `$VISUAL`, then `vi`.
+///
+/// Split out from [`open_in_editor`] so the precedence rules are testable
+/// without mutating the process environment (which is global, and racy under
+/// the parallel test runner).
+///
+/// Only whitespace splitting is supported, so `EDITOR="code -w"` works but
+/// `EDITOR="'/opt/My Editor/bin/x'"` does not. Quoting rules would need a real
+/// shell-word parser; anyone who needs that should point `$EDITOR` at a small
+/// wrapper script instead, which is the usual Unix answer.
+fn editor_command(editor: Option<String>, visual: Option<String>) -> (String, Vec<String>) {
+    // Blank must be normalised *before* the fallback chain, not after: an
+    // exported-but-empty EDITOR would otherwise win the `or` and silently
+    // shadow a perfectly good VISUAL.
+    let clean = |value: Option<String>| {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+
+    let raw = clean(editor)
+        .or_else(|| clean(visual))
+        .unwrap_or_else(|| "vi".to_string());
+
+    let mut parts = raw.split_whitespace();
+    let program = parts.next().unwrap_or("vi").to_string();
+    (program, parts.map(str::to_string).collect())
+}
+
+/// Launch the editor on `path`, giving it the terminal and taking it back.
+///
+/// The suspend/restore pair is unconditional: a failed spawn, a crash inside
+/// the editor, and a clean exit all leave the TUI in the same working state.
+/// `terminal.clear()` afterwards is not cosmetic — ratatui's buffer still
+/// believes the old frame is on screen, and the editor has painted over it, so
+/// without the clear the next draw would only emit a diff against a stale
+/// picture and leave the editor's output smeared through the UI.
+fn open_in_editor(
+    guard: &mut TerminalGuard,
+    terminal: &mut Tui,
+    app: &mut App,
+    path: &Path,
+) -> Result<()> {
+    let (program, args) =
+        editor_command(std::env::var("EDITOR").ok(), std::env::var("VISUAL").ok());
+
+    guard.suspend()?;
+    let status = Command::new(&program).args(&args).arg(path).status();
+    guard.resume()?;
+    terminal.clear()?;
+
+    // The editor may have renamed, truncated or deleted the file, so both panes
+    // are re-read rather than patched.
+    app.refresh_both_panels();
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+
+    app.status_msg = Some(match status {
+        Ok(exit) if exit.success() => format!("Closed {name}"),
+        Ok(exit) => match exit.code() {
+            Some(code) => format!("{program} exited with status {code}: {name}"),
+            None => format!("{program} was killed by a signal: {name}"),
+        },
+        Err(err) => format!("cannot launch {program}: {err}"),
+    });
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_precedence_is_editor_then_visual_then_vi() {
+        assert_eq!(
+            editor_command(Some("nvim".into()), Some("vim".into())).0,
+            "nvim"
+        );
+        assert_eq!(editor_command(None, Some("vim".into())).0, "vim");
+        assert_eq!(editor_command(None, None).0, "vi");
+    }
+
+    #[test]
+    fn blank_editor_variable_falls_through() {
+        // An exported-but-empty EDITOR is common in container images; treated
+        // as unset rather than as "run a program with an empty name".
+        assert_eq!(editor_command(Some(String::new()), None).0, "vi");
+        assert_eq!(editor_command(Some("   ".into()), None).0, "vi");
+        assert_eq!(
+            editor_command(Some(String::new()), Some("nano".into())).0,
+            "nano"
+        );
+    }
+
+    #[test]
+    fn editor_arguments_are_split_off_the_program() {
+        assert_eq!(
+            editor_command(Some("code -w --new-window".into()), None),
+            (
+                "code".to_string(),
+                vec!["-w".to_string(), "--new-window".to_string()]
+            )
+        );
+    }
 }

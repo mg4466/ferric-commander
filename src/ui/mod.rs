@@ -227,6 +227,33 @@ mod tests {
     }
 
     #[test]
+    fn empty_pane_shows_a_hint_instead_of_blank_space() {
+        let dir = tempdir("empty");
+        let app = app_at(dir.clone());
+        let text = render_to_string(&app, 100, 24);
+        assert!(text.contains("empty directory"), "hint missing");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn selected_rows_are_marked_with_an_asterisk() {
+        let dir = tempdir("marker");
+        std::fs::write(dir.join("picked.txt"), b"x").unwrap();
+        let mut app = app_at(dir.clone());
+        // Cursor starts on "..", which cannot be selected, so move first.
+        app.active_panel_mut().move_down();
+        app.handle_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(' '),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        let text = render_to_string(&app, 100, 24);
+        assert!(text.contains("* picked.txt"), "selection marker missing");
+        assert!(text.contains("1 selected"), "status tally not updated");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn narrow_terminal_does_not_panic() {
         // Degenerate sizes are where layout code divides by zero.
         let dir = tempdir("narrow");

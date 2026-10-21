@@ -22,13 +22,17 @@ Rust 1.85+ is required (edition 2024). Tested on rustc 1.99.1.
 | `j` / `Down`| Move cursor down              |
 | `k` / `Up`  | Move cursor up                |
 | `Tab`       | Switch active pane            |
-| `Enter`     | Enter directory               |
+| `Enter`     | Enter directory, or open file |
 | `Backspace` | Go to parent directory        |
 | `Space`     | Select row, advance cursor    |
 | `a`         | Invert selection              |
 | `F1` / `t`  | Cycle theme                   |
 | `F2` / `s`  | Cycle sort order              |
 | `F10` / `q` | Quit                          |
+
+On a regular file, `Enter` suspends the TUI and runs `$EDITOR` (falling back to
+`$VISUAL`, then `vi`), then restores the screen and re-reads both panes. On a
+directory it navigates; on a dangling symlink it reports on the status line.
 
 Copy, move, rename and delete arrive in Phases 3 and 4.
 
@@ -44,9 +48,10 @@ Copy, move, rename and delete arrive in Phases 3 and 4.
 ## Status
 
 - Phase 1 complete: terminal bootstrap, themes, synchronous filesystem engine,
-  navigation, sorting, selection. 21 tests, clippy clean.
-- Phase 2 next: `Table`-based panels, status bar polish, `$EDITOR` on Enter.
-- Phase 3: modals, in-place rename.
+  navigation, sorting, selection.
+- Phase 2 complete: `Table`-based panes with automatic scroll-into-view, empty
+  directory hint, `$EDITOR` launch with suspend/restore. 30 tests, clippy clean.
+- Phase 3 next: modal system (Confirm, Input, ErrorReport), in-place rename.
 - Phase 4: threaded copy/move/delete with progress and cancellation.
 
 ## Design notes worth reading

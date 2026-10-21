@@ -11,11 +11,25 @@
 //! `keymap.conf`; the dispatch structure below is already shaped for that split,
 //! since every arm calls a small named method instead of doing work inline.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::fs::panel::PanelState;
 use crate::theme::{Theme, ThemeType};
+
+/// Something the app cannot do by itself because it needs the terminal.
+///
+/// `App` is deliberately terminal-agnostic: it never touches raw mode or the
+/// alternate screen. Actions that require handing the screen to another process
+/// are returned to the event loop as an `Effect`, which owns the
+/// suspend/restore dance. That keeps `App` fully testable without a real TTY.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect {
+    /// Suspend the TUI, run `$EDITOR` on this path, then resume and refresh.
+    OpenInEditor(PathBuf),
+}
 
 /// Which pane receives navigation keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,35 +151,56 @@ impl App {
     /// Route one key press. Only `Press` events reach here: crossterm also
     /// reports Release/Repeat on Windows and on enhanced terminals, and acting
     /// on those would fire every action twice.
-    pub fn handle_key_event(&mut self, key: KeyEvent) {
+    /// Returns an [`Effect`] when the key requires the terminal (see `main.rs`).
+    pub fn handle_key_event(&mut self, key: KeyEvent) -> Option<Effect> {
         // Ctrl+C is a reflex for killing a misbehaving TUI; honour it even
         // though raw mode means the terminal will not generate SIGINT.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
-            return;
+            return None;
         }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::F(10) => self.should_quit = true,
+            KeyCode::Char('q') | KeyCode::F(10) => {
+                self.should_quit = true;
+                None
+            }
 
-            KeyCode::Tab => self.switch_pane(),
+            KeyCode::Tab => {
+                self.switch_pane();
+                None
+            }
 
             KeyCode::Up | KeyCode::Char('k') => {
                 self.clear_status();
                 self.active_panel_mut().move_up();
+                None
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.clear_status();
                 self.active_panel_mut().move_down();
+                None
             }
 
-            KeyCode::Enter => self.enter_directory(),
-            KeyCode::Backspace => self.go_parent(),
+            KeyCode::Enter => self.activate_cursor(),
+            KeyCode::Backspace => {
+                self.go_parent();
+                None
+            }
 
-            KeyCode::Char(' ') | KeyCode::Insert => self.active_panel_mut().toggle_select(),
-            KeyCode::Char('a') => self.active_panel_mut().invert_selection(),
+            KeyCode::Char(' ') | KeyCode::Insert => {
+                self.active_panel_mut().toggle_select();
+                None
+            }
+            KeyCode::Char('a') => {
+                self.active_panel_mut().invert_selection();
+                None
+            }
 
-            KeyCode::F(1) | KeyCode::Char('t') => self.cycle_theme(),
+            KeyCode::F(1) | KeyCode::Char('t') => {
+                self.cycle_theme();
+                None
+            }
             KeyCode::F(2) | KeyCode::Char('s') => {
                 self.active_panel_mut().cycle_sort();
                 let panel = self.active_panel();
@@ -174,13 +209,49 @@ impl App {
                     panel.sort_col.label(),
                     if panel.sort_asc { "Asc" } else { "Desc" }
                 ));
+                None
             }
 
             // Everything else is unbound for now. Swallowing it (rather than
             // falling through to a default action) is what keeps a stray key
             // from doing something destructive.
-            _ => {}
+            _ => None,
         }
+    }
+
+    /// Act on the row under the cursor: the single entry point for Enter, so
+    /// the "what is this thing" decision lives in exactly one place.
+    ///
+    /// Directories and ".." change the pane's own state. A regular file is not
+    /// something this app should silently ignore — it hands back an
+    /// `Effect::OpenInEditor` and lets the event loop deal with the terminal.
+    fn activate_cursor(&mut self) -> Option<Effect> {
+        let entry = self.active_panel().selected_entry()?;
+
+        // Decide from borrowed data, then act: the panel is borrowed here, so
+        // the clone of the path is what lets `self` be mutated below.
+        let path = entry.path.clone();
+        let is_parent_nav = entry.is_parent_nav;
+        let is_dir = entry.is_dir;
+        let is_broken = entry.is_broken_symlink;
+
+        if is_parent_nav {
+            self.go_parent();
+            return None;
+        }
+
+        if is_broken {
+            self.status_msg = Some(format!("{path:?} is a broken symlink"));
+            return None;
+        }
+
+        if is_dir {
+            self.enter_directory();
+            return None;
+        }
+
+        self.clear_status();
+        Some(Effect::OpenInEditor(path))
     }
 
     /// Enter a directory, surfacing a failure on the status line without
@@ -266,6 +337,75 @@ mod tests {
         app.handle_key_event(key(KeyCode::F(1)));
         assert_ne!(app.theme.name, before);
         assert_eq!(app.theme.name, app.theme_type.palette().name);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Put the cursor on the entry with this name.
+    fn focus(app: &mut App, name: &str) {
+        let panel = app.active_panel_mut();
+        let index = panel
+            .entries
+            .iter()
+            .position(|e| e.name == name)
+            .unwrap_or_else(|| panic!("no entry named {name}"));
+        panel.table_state.select(Some(index));
+    }
+
+    #[test]
+    fn enter_on_a_file_requests_the_editor() {
+        let (mut app, dir) = app_at_tempdir();
+        focus(&mut app, "file.txt");
+
+        let effect = app.handle_key_event(key(KeyCode::Enter));
+        match effect {
+            Some(Effect::OpenInEditor(path)) => assert_eq!(path, dir.join("file.txt")),
+            other => panic!("expected OpenInEditor, got {other:?}"),
+        }
+        // The pane must not have navigated anywhere.
+        assert_eq!(app.active_panel().cwd, dir);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn enter_on_a_directory_navigates_and_yields_no_effect() {
+        let (mut app, dir) = app_at_tempdir();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        app.refresh_both_panels();
+        focus(&mut app, "sub");
+
+        assert_eq!(app.handle_key_event(key(KeyCode::Enter)), None);
+        assert_eq!(app.active_panel().cwd, dir.join("sub"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn enter_on_parent_row_goes_up() {
+        let (mut app, dir) = app_at_tempdir();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        app.refresh_both_panels();
+        focus(&mut app, "sub");
+        app.handle_key_event(key(KeyCode::Enter));
+        assert_eq!(app.active_panel().cwd, dir.join("sub"));
+
+        // ".." is index 0 by construction.
+        app.active_panel_mut().table_state.select(Some(0));
+        assert_eq!(app.handle_key_event(key(KeyCode::Enter)), None);
+        assert_eq!(app.active_panel().cwd, dir);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enter_on_a_broken_symlink_reports_instead_of_spawning() {
+        let (mut app, dir) = app_at_tempdir();
+        std::os::unix::fs::symlink(dir.join("missing"), dir.join("dangling")).unwrap();
+        app.refresh_both_panels();
+        focus(&mut app, "dangling");
+
+        assert_eq!(app.handle_key_event(key(KeyCode::Enter)), None);
+        let message = app.status_msg.as_deref().unwrap_or_default();
+        assert!(message.contains("broken symlink"), "got {message:?}");
+        assert_eq!(app.active_panel().cwd, dir);
         std::fs::remove_dir_all(dir).ok();
     }
 

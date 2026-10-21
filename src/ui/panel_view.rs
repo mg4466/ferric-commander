@@ -1,24 +1,33 @@
 //! Rendering of one directory pane.
 //!
-//! Phase 1 draws a plain scrolling list. Phase 2 swaps the body for a
-//! `ratatui::widgets::Table` driven by `PanelState::table_state`; the row
-//! decoration rules (markers, colours, symlink and broken-link styling) are
-//! defined here once so that the swap does not change how a row looks.
+//! The pane body is a `Table` driven by `PanelState::table_state`. Using a
+//! stateful widget rather than a hand-scrolled list is what makes the cursor
+//! follow the selection automatically: `Table` adjusts `TableState::offset` so
+//! the selected row stays on screen, including after a resize or a sort that
+//! moves it. Phase 1 hand-computed that offset; this is both shorter and
+//! correct for the cases the hand-rolled version got wrong.
 //!
 //! Row grammar, fixed by the specification:
 //!
 //!   `*`  row is selected        `/`  entry is a directory
 //!   `@`  entry is a symlink     `!`  symlink target is missing
 //!   `>`  row holds the cursor
+//!
+//! The renderer never stats anything. Every fact it needs (is this a directory,
+//! is this link dangling, how big is it) was decided once in `fs::panel`, so a
+//! frame costs zero syscalls.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Constraint, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, HighlightSpacing, Paragraph, Row, Table, TableState};
 
 use crate::fs::panel::{DirectoryEntry, PanelState};
 use crate::theme::Theme;
+
+/// Width of the right-hand size/kind column, matching the spec's ASCII sketch.
+const TRAILING_COLUMN: u16 = 14;
 
 /// Draw `panel` into `area`.
 ///
@@ -47,40 +56,45 @@ pub fn render(frame: &mut Frame, panel: &PanelState, area: Rect, active: bool, t
         .title(title)
         .style(Style::default().bg(theme.bg).fg(theme.fg));
 
-    let inner_height = block.inner(area).height as usize;
-    let cursor = panel.cursor();
-    let lines: Vec<Line> = panel
+    let inner = block.inner(area);
+
+    let rows: Vec<Row> = panel
         .entries
         .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            row_line(
-                entry,
-                index == cursor.unwrap_or(usize::MAX),
-                panel.selected.contains(&entry.path),
-                theme,
-            )
+        .map(|entry| {
+            let is_selected = panel.selected.contains(&entry.path);
+            Row::new(vec![
+                name_cell(entry, is_selected, theme),
+                trailing_cell(entry, theme),
+            ])
         })
         .collect();
 
-    // Keep the cursor on screen. One line of slack below it means the cursor
-    // never sits flush against the border.
-    let scroll = cursor
-        .map(|c| (c + 1).saturating_sub(inner_height.max(1)))
-        .unwrap_or(0) as u16;
+    let table = Table::new(
+        rows,
+        [Constraint::Min(10), Constraint::Length(TRAILING_COLUMN)],
+    )
+    .block(block)
+    // Reserving the symbol width on every row (not just the highlighted one)
+    // keeps the names aligned in a column as the cursor moves.
+    .highlight_spacing(HighlightSpacing::Always)
+    .highlight_symbol("> ")
+    .row_highlight_style(Style::default().bg(theme.cursor_bg).fg(theme.cursor_fg));
 
-    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
+    // `TableState` is two words (offset + selected index), so cloning it costs
+    // nothing next to the frame itself — and it avoids threading `&mut App`
+    // through the entire render tree just to satisfy `render_stateful_widget`.
+    let mut state: TableState = panel.table_state.clone();
 
-    frame.render_widget(paragraph, area);
+    frame.render_stateful_widget(table, area, &mut state);
+
+    if panel.is_empty() {
+        render_empty_hint(frame, inner, theme);
+    }
 }
 
-/// Build one decorated row.
-fn row_line(
-    entry: &DirectoryEntry,
-    is_cursor: bool,
-    is_selected: bool,
-    theme: &Theme,
-) -> Line<'static> {
+/// The name column: marker prefix, then the entry name.
+fn name_cell(entry: &DirectoryEntry, is_selected: bool, theme: &Theme) -> Line<'static> {
     let marker = if is_selected {
         '*'
     } else if entry.is_broken_symlink {
@@ -92,8 +106,6 @@ fn row_line(
     } else {
         ' '
     };
-
-    let cursor_glyph = if is_cursor { '>' } else { ' ' };
 
     let name_style = if entry.is_broken_symlink {
         Style::default().fg(theme.error_fg)
@@ -113,40 +125,41 @@ fn row_line(
         name_style
     };
 
-    let mut spans = vec![
-        Span::styled(
-            format!("{cursor_glyph}{marker} "),
-            Style::default().fg(theme.fg),
-        ),
+    Line::from(vec![
+        Span::styled(format!("{marker} "), Style::default().fg(theme.fg)),
         Span::styled(entry.name.clone(), name_style),
-    ];
+    ])
+}
 
-    if let Some(kind) = kind_label(entry) {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            kind.to_string(),
-            Style::default().fg(theme.border_inactive),
-        ));
+/// The right-hand column: a kind label for directories and links, a size for
+/// regular files. Right-aligned so numbers line up.
+fn trailing_cell(entry: &DirectoryEntry, theme: &Theme) -> Line<'static> {
+    let text = match kind_label(entry) {
+        Some(kind) => kind.to_string(),
+        None => format_size(entry.size),
+    };
+
+    Line::from(Span::styled(
+        text,
+        Style::default().fg(theme.border_inactive),
+    ))
+    .alignment(Alignment::Right)
+}
+
+/// Shown over an empty pane so a blank rectangle is unambiguous.
+fn render_empty_hint(frame: &mut Frame, area: Rect, theme: &Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
     }
 
-    if !entry.is_dir && !entry.is_parent_nav {
-        let size = format_size(entry.size);
-        let width = 14usize;
-        spans.push(Span::raw(
-            " ".repeat(width.saturating_sub(size.len()).max(1)),
-        ));
-        spans.push(Span::styled(
-            size,
-            Style::default().fg(theme.border_inactive),
-        ));
-    }
+    let hint = Paragraph::new(Line::from(Span::styled(
+        "empty directory",
+        Style::default().fg(theme.border_inactive),
+    )))
+    .alignment(Alignment::Center);
 
-    let line = Line::from(spans);
-    if is_cursor {
-        line.style(Style::default().bg(theme.cursor_bg).fg(theme.cursor_fg))
-    } else {
-        line
-    }
+    let y = area.y + area.height / 2;
+    frame.render_widget(hint, Rect::new(area.x, y, area.width, 1));
 }
 
 /// The type column shown after the name.
