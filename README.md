@@ -8,6 +8,8 @@ The authoritative specification is `Ferric_Commander_Specification.txt`. Section
 of that document records the design amendments and the decisions taken before
 implementation began.
 
+Released under the MIT licence.
+
 ## Build
 
     cargo build --release
@@ -118,3 +120,11 @@ end instead of stopping the batch.
 - **The worker treats a disconnected control channel as a cancel**, so quitting
   the UI mid-copy stops the writes instead of orphaning a thread that keeps
   filling the disk.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE). In short: use it, change it, ship it, sell it;
+keep the copyright notice; no warranty.
+
+Dependencies are MIT/Apache-2.0 licensed (ratatui, crossterm, anyhow), so the
+MIT choice is compatible with all of them.
