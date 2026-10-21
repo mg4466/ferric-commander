@@ -1,0 +1,552 @@
+﻿Ferric Commander (fc) is a lightweight, dual-pane terminal file manager built in Rust (2024 edition). The architecture eschews async runtimes (tokio, async-std) in favor of deterministic, non-blocking event polling coupled with OS-native worker threads (std::thread) and channels (std::sync::mpsc). This guarantees a locked 60 FPS UI loop even during multi-gigabyte I/O operations.
+
+1. Module Breakdown & Project Structure
+
+The codebase enforces strict separation between state (app), rendering (ui), synchronous listing (fs), and asynchronous mutations (tasks).
+
+ferric-commander/
+├── Cargo.toml
+└── src/
+   ├── main.rs            # Entry point, TerminalGuard (RAII), panic hook, main loop
+   ├── app.rs             # App state machine, input routing, modal & task coordination
+   ├── theme.rs           # Color palette definitions (Catppuccin, Dracula, Tokyo Night)
+   ├── fs/
+   │   ├── mod.rs         # Re-exports
+   │   └── panel.rs       # PanelState, DirectoryEntry, symlink-safe reading, sorting
+   ├── tasks/
+   │   ├── mod.rs         # Task definitions, TaskUpdate / ControlSignal enums
+   │   └── worker.rs      # Background thread spawning, recursive Copy/Move/Delete I/O
+   └── ui/
+       ├── mod.rs         # Main layout composition (50/50 split, status bar, F-key bar)
+       ├── panel_view.rs  # Stateful table rendering for directory contents
+       └── modal.rs       # Centered popup overlays (Confirm, Rename, Progress, Error)
+
+Cargo.toml Dependencies
+[package]
+name = "ferric-commander"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.28"
+ratatui = "0.29"
+
+2. Core Data Structures
+
+All core types are designed to be cheaply cloneable where needed for thread boundaries, avoiding shared mutexes (Arc<Mutex<T>>) in favor of message passing.
+src/theme.rs
+use ratatui::style::Color;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeType {
+   CatppuccinMocha,
+   Dracula,
+   TokyoNight,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Theme {
+   pub name: &'static str,
+   pub bg: Color,
+   pub fg: Color,
+   pub border_inactive: Color,
+   pub border_active: Color,
+   pub cursor_bg: Color,
+   pub cursor_fg: Color,
+   pub selected_fg: Color,
+   pub dir_fg: Color,
+   pub symlink_fg: Color,
+   pub error_fg: Color,
+   pub fkey_bg: Color,
+   pub fkey_fg: Color,
+}
+
+impl ThemeType {
+   pub fn next(self) -> Self {
+       match self {
+           Self::CatppuccinMocha => Self::Dracula,
+           Self::Dracula => Self::TokyoNight,
+           Self::TokyoNight => Self::CatppuccinMocha,
+       }
+   }
+
+   pub fn palette(self) -> Theme {
+       match self {
+           Self::CatppuccinMocha => Theme {
+               name: "Catppuccin Mocha",
+               bg: Color::Rgb(30, 30, 46),
+               fg: Color::Rgb(205, 214, 244),
+               border_inactive: Color::Rgb(88, 91, 112),
+               border_active: Color::Rgb(137, 180, 250),
+               cursor_bg: Color::Rgb(69, 71, 90),
+               cursor_fg: Color::Rgb(205, 214, 244),
+               selected_fg: Color::Rgb(249, 226, 175),
+               dir_fg: Color::Rgb(137, 180, 250),
+               symlink_fg: Color::Rgb(148, 226, 213),
+               error_fg: Color::Rgb(243, 139, 168),
+               fkey_bg: Color::Rgb(24, 24, 37),
+               fkey_fg: Color::Rgb(166, 227, 161),
+           },
+           Self::Dracula => Theme {
+               name: "Dracula",
+               bg: Color::Rgb(40, 42, 54),
+               fg: Color::Rgb(248, 248, 242),
+               border_inactive: Color::Rgb(98, 114, 164),
+               border_active: Color::Rgb(189, 147, 249),
+               cursor_bg: Color::Rgb(68, 71, 90),
+               cursor_fg: Color::Rgb(248, 248, 242),
+               selected_fg: Color::Rgb(241, 250, 140),
+               dir_fg: Color::Rgb(139, 233, 253),
+               symlink_fg: Color::Rgb(255, 121, 198),
+               error_fg: Color::Rgb(255, 85, 85),
+               fkey_bg: Color::Rgb(33, 34, 44),
+               fkey_fg: Color::Rgb(80, 250, 123),
+           },
+           Self::TokyoNight => Theme {
+               name: "Tokyo Night",
+               bg: Color::Rgb(26, 27, 38),
+               fg: Color::Rgb(192, 202, 245),
+               border_inactive: Color::Rgb(65, 72, 104),
+               border_active: Color::Rgb(122, 162, 247),
+               cursor_bg: Color::Rgb(41, 46, 66),
+               cursor_fg: Color::Rgb(192, 202, 245),
+               selected_fg: Color::Rgb(224, 175, 104),
+               dir_fg: Color::Rgb(125, 207, 255),
+               symlink_fg: Color::Rgb(187, 154, 247),
+               error_fg: Color::Rgb(247, 118, 142),
+               fkey_bg: Color::Rgb(22, 22, 30),
+               fkey_fg: Color::Rgb(158, 206, 106),
+           },
+       }
+   }
+}
+
+src/fs/panel.rs
+use ratatui::widgets::TableState;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::time::SystemTime;
+
+#[derive(Debug, Clone)]
+pub struct DirectoryEntry {
+   pub name: String,
+   pub path: PathBuf,
+   pub is_dir: bool,
+   pub is_symlink: bool,
+   pub is_broken_symlink: bool,
+   pub is_parent_nav: bool, // True only for the synthetic ".." entry
+   pub size: u64,
+   pub modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortColumn {
+   Name,
+   Size,
+   Modified,
+}
+
+#[derive(Debug)]
+pub struct PanelState {
+   pub cwd: PathBuf,
+   pub entries: Vec<DirectoryEntry>,
+   pub table_state: TableState,
+   pub selected: HashSet<PathBuf>,
+   pub sort_col: SortColumn,
+   pub sort_asc: bool,
+}
+
+src/tasks/mod.rs
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoOperation {
+   Copy,
+   Move,
+   Delete,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileTask {
+   pub op: IoOperation,
+   pub sources: Vec<PathBuf>,
+   pub destination: Option<PathBuf>, // None for Delete
+}
+
+#[derive(Debug, Clone)]
+pub enum TaskUpdate {
+   Started {
+       total_items: usize,
+       total_bytes: u64,
+   },
+   Progress {
+       current_file: String,
+       items_processed: usize,
+       bytes_processed: u64,
+   },
+   NonFatalError {
+       path: PathBuf,
+       error: String,
+   },
+   Completed {
+       skipped_errors: Vec<(PathBuf, String)>,
+   },
+   Aborted {
+       reason: String,
+   },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum WorkerControl {
+   Cancel,
+}
+
+pub struct ActiveTaskHandle {
+   pub rx: Receiver<TaskUpdate>,
+   pub cancel_tx: Sender<WorkerControl>,
+   pub op: IoOperation,
+   pub current_file: String,
+   pub items_done: usize,
+   pub total_items: usize,
+   pub bytes_done: u64,
+   pub total_bytes: u64,
+}
+
+src/app.rs
+use crate::fs::panel::PanelState;
+use crate::tasks::{ActiveTaskHandle, FileTask};
+use crate::theme::{Theme, ThemeType};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivePane {
+   Left,
+   Right,
+}
+
+#[derive(Debug)]
+pub enum ModalState {
+   None,
+   Confirm {
+       title: String,
+       prompt: String,
+       pending_task: FileTask,
+   },
+   Input {
+       title: String,
+       input_buffer: String,
+       cursor_pos: usize,
+       pending_op: InputAction,
+   },
+   Progress, // Draws data directly from App::active_task
+   ErrorReport {
+       title: String,
+       errors: Vec<String>,
+       scroll_offset: u16,
+   },
+}
+
+#[derive(Debug, Clone)]
+pub enum InputAction {
+   RenameSingle( std::path::PathBuf ),
+}
+
+pub struct App {
+   pub left_panel: PanelState,
+   pub right_panel: PanelState,
+   pub active_pane: ActivePane,
+   pub modal: ModalState,
+   pub active_task: Option<ActiveTaskHandle>,
+   pub theme_type: ThemeType,
+   pub theme: Theme,
+   pub status_msg: Option<String>,
+   pub should_quit: bool,
+}
+
+3. Event Loop & Concurrency Architecture
+
+To guarantee a lock-free 60 FPS UI, the main thread operates on a strict 16 milliseconds budget per tick. It interleaves non-blocking task channel drains, bounded Crossterm event polling, and Ratatui frame rendering.
+Main Loop Pseudocode & Flow (src/main.rs)
+
+This section supersedes the original sketch; two defects in it are corrected here.
+
+  * The worker drain must live inside App (App::pump_worker). Draining in main.rs
+    through `&mut app.active_task` and then calling `app.apply_task_update(update)`
+    takes two simultaneous mutable borrows of App, which does not compile.
+  * last_tick is advanced to Instant::now() rather than incremented, so a frame that
+    overruns its 16 ms budget can never leave the loop spinning with a zero-length
+    poll timeout in an attempt to "catch up".
+
+use std::time::{Duration, Instant};
+use crossterm::event::{self, Event, KeyEventKind};
+
+/// ~60 FPS. Also the longest the loop will sleep waiting for input.
+const TICK_RATE: Duration = Duration::from_millis(16);
+
+/// Upper bound on worker messages consumed per frame, so a chatty worker can
+/// never starve rendering.
+const MAX_UPDATES_PER_FRAME: usize = 100;
+
+fn run_app(terminal: &mut Terminal<impl Backend>, app: &mut App) -> anyhow::Result<()> {
+   let mut last_tick = Instant::now();
+
+   loop {
+       // 1. Drain worker updates. Non-blocking, bounded, and owns the borrow of App.
+       app.pump_worker(MAX_UPDATES_PER_FRAME);
+
+       // 2. Render first, so key latency is at most one frame.
+       terminal.draw(|frame| ui::render(frame, app))?;
+
+       // 3. Wait for input for the remainder of this frame's budget.
+       let budget = TICK_RATE.saturating_sub(last_tick.elapsed());
+       if event::poll(budget)? {
+           if let Event::Key(key) = event::read()? {
+               if key.kind == KeyEventKind::Press {
+                   app.handle_key_event(key);
+               }
+           }
+           // Resize needs no handling: ratatui observes the new area on the next
+           // terminal.draw(), because the backend autoresizes every frame.
+       }
+
+       // 4. Advance the clock only once the frame deadline has passed.
+       if last_tick.elapsed() >= TICK_RATE {
+           last_tick = Instant::now();
+       }
+
+       if app.should_quit {
+           break;
+       }
+   }
+
+   Ok(())
+}
+
+Worker Thread Execution Model (src/tasks/worker.rs)
+1. Spawning: When the user confirms an operation, App creates two mpsc::channel() pairs (update_tx/rx and cancel_tx/rx), stores the handle in app.active_task, sets app.modal = ModalState::Progress, and spawns a detached std::thread.
+2. Pre-flight Scan: The worker thread first performs a non-following walk (fs::symlink_metadata) of the source paths to compute total_items and total_bytes, emitting TaskUpdate::Started.
+3. Chunked I/O & Cancellation:
+   * For files larger than 1 MB, rather than calling std::fs::copy (which blocks cancellation until the entire file finishes), the worker opens File handles and copies in 64 KB buffers, checking cancel_rx.try_recv() between chunks.
+   * Progress throttling: TaskUpdate::Progress is NOT sent per 64 KB chunk. At 64 KB
+     granularity a single 5 GB file yields ~80,000 messages, which the 100-per-frame
+     drain cap can never keep up with and which makes the gauge lag seconds behind
+     reality. The worker emits Progress at most once every 50 ms, and always once
+     when a file finishes. Accumulated item/byte counters are carried in the message,
+     so a dropped intermediate update never loses information.
+   * For Move operations, the worker first attempts std::fs::rename(src, dst). If that fails with io::ErrorKind::CrossesDevices (EXDEV), it transparently falls back to recursive Copy + Delete.
+4. Edge Cases & Error Handling Strategy
+1. Terminal State Safety (RAII Drop Guard & Panic Hook)
+If a panic occurs while Crossterm is in raw mode or the alternate screen, the user's terminal becomes unusable. We solve this with a dual-layer defense in src/main.rs:
+pub struct TerminalGuard;
+
+impl TerminalGuard {
+   pub fn init() -> anyhow::Result<Self> {
+       let original_hook = std::panic::take_hook();
+       std::panic::set_hook(Box::new(move |panic_info| {
+           let _ = Self::restore();
+           original_hook(panic_info);
+       }));
+
+       crossterm::terminal::enable_raw_mode()?;
+       crossterm::execute!(
+           std::io::stdout(),
+           crossterm::terminal::EnterAlternateScreen,
+           crossterm::cursor::Hide
+       )?;
+       Ok(Self)
+   }
+
+   fn restore() -> anyhow::Result<()> {
+       crossterm::execute!(
+           std::io::stdout(),
+           crossterm::terminal::LeaveAlternateScreen,
+           crossterm::cursor::Show
+       )?;
+       crossterm::terminal::disable_raw_mode()?;
+       Ok(())
+   }
+}
+
+impl Drop for TerminalGuard {
+   fn drop(&mut self) {
+       let _ = Self::restore();
+   }
+}
+
+2. Symlink Safety & Circular Loop Prevention
+
+* Never follow symlinks during recursive traversal. In both PanelState::read_dir and the worker's recursive copy/delete walkers, always inspect entries using std::fs::symlink_metadata(&path) rather than std::fs::metadata(&path) or path.is_dir().
+
+* Directory Navigation vs. Traversal:
+
+* When the user presses Enter on a directory symlink in the UI, PanelState does follow it (std::fs::read_dir(&entry.path)), allowing normal navigation into linked folders.
+
+* When a background worker copies a symlink, it reads the link target (std::fs::read_link) and recreates the link at the destination (std::os::unix::fs::symlink / std::os::windows::fs::symlink_file) rather than recursively copying the target tree.
+
+* When deleting a symlink, std::fs::remove_file is called on the symlink itself—never walking into the target directory.
+
+3. Graceful Filesystem Error Surfacing
+
+Filesystem errors (PermissionDenied, NotFound, AlreadyExists) must never crash the application or unwrap on the main thread.
+Context
+	Error Condition
+	Recovery & UI Surfacing Strategy
+	Directory Listing (PanelState)
+	User hits Enter on /root (Permission Denied) or a deleted folder.
+	Attempt fs::read_dir(target) before mutating panel.cwd. On Err(e), retain current cwd and set app.modal = ModalState::ErrorReport with the OS error string.
+	Broken Symlinks
+	fs::symlink_metadata succeeds, but fs::metadata (target check) fails.
+	Render entry normally in the panel with is_broken_symlink = true (styled with theme.error_fg and prefixed with !).
+	Background Worker I/O
+	One file in a 500-file batch fails due to read permissions.
+	Worker catches the io::Error, sends TaskUpdate::NonFatalError { path, error }, pushes it to a local error log, and continues processing remaining files. Upon completion, TaskUpdate::Completed { skipped_errors } triggers ModalState::ErrorReport listing all failed paths.
+	Self-Containment Violation
+	User attempts to copy or move /a/b into /a/b/c.
+	Checked prior to spawning the worker via dst.starts_with(src). Immediately intercepted and displayed via ModalState::ErrorReport.
+
+	Destination Conflict
+	Copy or move would overwrite an existing name; rename target already exists.
+	NEVER silent. The Confirm modal gains a conflict banner listing the clashes, and Enter requires a second confirming press (Confirm -> ConflictConfirm). Choosing overwrite replaces the destination; choosing skip leaves it untouched and counts the item as skipped. fs::rename is never called on an existing path without that acknowledgement.
+	Self-Containment Check Path
+	dst is the inactive pane's cwd, so dst.starts_with(src) is true for /a -> /a itself but silently false for the real target /a/b.
+	The guard compares against the actual written path (dst.join(basename)) after lexical normalisation (Path::components, no canonicalize, which would fail on not-yet-existing destinations). Overlapping operand sets are deduplicated by ancestor before the worker is spawned.
+	Cancelled Mid-File
+	User presses Esc during a Progress modal.
+	The in-flight partial file is removed; fully completed items are kept; partially copied directories keep only their completed children. TaskUpdate::Aborted carries the counts so the UI can report exactly what survived.
+
+5. Keybindings & UI Layout Specification
+
+┌─ /home/user/projects [Name ▲] ───────┐┌─ /tmp/backup [Size ▼] ───────────────┐
+│  ..                            <DIR> ││  ..                            <DIR> │
+│> src                           <DIR> ││  archive.tar.gz              42.1 MB │
+│* Cargo.lock                    14 KB ││  notes.txt                    1.2 KB │
+│* Cargo.toml                    412 B ││                                      │
+│  @latest -> ./target/release   <SYM> ││                                      │
+├─ 2 selected (14.4 KB) / 4 items ─────┘└─ 0 selected (0 B) / 2 items ─────────┘
+[Theme: Catppuccin Mocha] Ready.
+F1 Theme  F2 Sort   F5 Copy   F6 Move   F7 Rename F8 Delete F10 Quit
+
+* Navigation: Up/Down or j/k (Move cursor), Tab (Switch active pane), Enter (Enter directory), Backspace (Go to parent directory).
+* Open: Enter on a regular file suspends the TUI and opens the file in $EDITOR (falling back to $VISUAL, then vi). TerminalGuard::suspend()/resume() wrap the child process; the alternate screen and raw mode are restored before the editor starts and re-entered once it exits, then both panels refresh. A non-zero exit or spawn failure surfaces as a status message rather than a crash.
+* Selection: Space or Insert (Toggle selection on highlighted item and advance cursor down 1 row), a (Invert selection). Note: ".." cannot be selected.
+* Operations:
+   * F1 or t: Cycle color theme (Catppuccin Mocha -> Dracula -> Tokyo Night).
+   * F2 or s: Cycle sort order (Name Asc -> Name Desc -> Size Desc -> Modified Desc).
+   * F5 or c: Copy selected items (or item under cursor if selected.is_empty()) to inactive pane's cwd. Opens Confirm Modal.
+   * F6 or m: Move selected items to inactive pane's cwd. Opens Confirm Modal.
+   * F7 or r: Rename item under cursor in-place. Opens Input Modal pre-filled with current filename.
+   * F8 or d / Delete: Delete selected items (or cursor item). Opens Confirm Modal.
+   * F10 or q: Quit application (Esc cancels modals or aborts an active worker task).
+6. Strict 4-Phase Implementation Plan
+
+An implementation engineer or coding agent should execute the build in the following strict sequence, compiling and verifying after each phase.
+
+Phase 1: Terminal Bootstrap, Themes, and Synchronous Filesystem Engine
+
+Goal: Compile a binary that initializes raw mode safely, reads the current working directory into two panels, and cleanly exits on q or F10.
+1. Create Cargo.toml with ratatui, crossterm, and anyhow.
+2. Implement src/theme.rs: Define ThemeType, Theme, and the RGB palettes for Catppuccin, Dracula, and Tokyo Night.
+3. Implement src/fs/panel.rs & src/fs/mod.rs:
+   * Implement PanelState::new(path: PathBuf) -> anyhow::Result<Self>.
+   * Implement PanelState::refresh(&mut self) -> anyhow::Result<()>:
+      * Clear entries. If self.cwd.parent().is_some(), push synthetic ".." entry (is_parent_nav = true).
+      * Iterate std::fs::read_dir(&self.cwd). Use entry.metadata() via std::fs::symlink_metadata to populate is_symlink, size, and modified. If is_symlink is true, check std::fs::metadata(&path) to determine if the target is a directory (is_dir) or broken (is_broken_symlink).
+   * Implement PanelState::sort(&mut self): Keep ".." pinned at index 0. Sort the slice [1..] first by is_dir descending (directories always on top), then by self.sort_col and self.sort_asc.
+   * Implement cursor helpers (move_up, move_down, toggle_select, enter_directory, get_operated_paths).
+
+Phase 2: App State Machine & Dual-Pane Ratatui Rendering
+
+Goal: Full visual rendering of both panels, theme switching, sorting toggles, and directory navigation at 60 FPS.
+1. Implement src/app.rs:
+   * Construct App::new() initializing both left_panel and right_panel to std::env::current_dir().
+   * Implement App::active_panel_mut() and App::inactive_panel().
+   * Implement keyboard navigation handlers (Tab, Up/Down, Enter, Backspace, Space, F1 theme cycle, F2 sort cycle, F10 quit).
+
+2. Implement src/ui/panel_view.rs & src/ui/mod.rs:
+   * Use Layout::default().direction(Direction::Vertical) for main area (Min(3)), status bar (Length(1)), and F-key bar (Length(1)).
+   * Split main area 50/50 horizontally for left and right panels.
+   * Render each panel using ratatui::widgets::Table with Frame::render_stateful_widget. Prefix selected rows with *, directories with /, and symlinks with @. Color rows using the active Theme.
+
+3. Implement src/main.rs:
+   * Wire TerminalGuard::init(), App::new(), and the 16ms run_app event loop.
+Phase 3: Modal System & In-Place Rename
+Goal: Add overlay popups (Confirm, Input, ErrorReport) and implement synchronous single-file rename (F7).
+
+1. Implement src/ui/modal.rs:
+   * Write a helper centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect.
+   * Use ratatui::widgets::Clear before rendering the modal Block so underlying panel text does not bleed through.
+   * Implement views for ModalState::Confirm, ModalState::Input, ModalState::Progress (using ratatui::widgets::Gauge), and ModalState::ErrorReport.
+2. Update src/app.rs Input Routing:
+   * Branch handle_key_event based on &mut self.modal. When a modal is open, trap all key events inside the modal handler (Enter confirms, Esc dismisses, character keys mutate input_buffer in ModalState::Input).
+   * Wire F7 (Rename) to open ModalState::Input and execute std::fs::rename upon pressing Enter, surfacing any error directly to ModalState::ErrorReport.
+Phase 4: Multithreaded I/O Worker & Progress Pipeline
+Goal: Implement background Copy (F5), Move (F6), and Delete (F8) with live progress bars and cancellation.
+
+1. Implement src/tasks/mod.rs & src/tasks/worker.rs:
+   * Write spawn_worker(task: FileTask) -> ActiveTaskHandle.
+   * Implement calculate_totals(paths: &[PathBuf]) -> (usize, u64) using an iterative stack (avoiding deep recursion stack overflows) and fs::symlink_metadata.
+   * Implement recursive copy_node, move_node, and delete_node:
+      * Check cancel_rx.try_recv() before each file and inside the 64 KB read/write loop.
+      * Emit TaskUpdate::Progress after each chunk/file.
+      * Catch any std::io::Error per item, send TaskUpdate::NonFatalError, record it, and continue.
+
+2. Connect Worker to src/app.rs:
+   * Wire F5, F6, and F8 to validate paths (ensuring non-empty target set and checking dst.starts_with(src)) and transition to ModalState::Confirm.
+   * When the user presses Enter on ModalState::Confirm, spawn the worker, store ActiveTaskHandle, and switch to ModalState::Progress.
+   * Handle Esc during ModalState::Progress by sending WorkerControl::Cancel over cancel_tx.
+   * Upon receiving TaskUpdate::Completed or TaskUpdate::Aborted in main.rs, clear selection sets, call refresh_both_panels(), and either close the modal or transition to ModalState::ErrorReport if skipped_errors is non-empty.
+
+7. Amendments, Decisions & Deferred Work
+
+7.1 Decisions taken before implementation
+
+   ID  Topic                     Decision
+   D1  Destination conflicts     Prompt. No operation ever overwrites silently; the Confirm modal
+                                 shows the clashing names and requires a second Enter. "Skip" is
+                                 offered alongside "Overwrite".
+   D2  Abort cleanup             Delete the in-flight partial file; keep completed items; report the
+                                 abort with counts.
+   D3  Tests                     Written alongside each phase, not deferred. Ratatui TestBackend
+                                 render smoke tests plus unit tests for sorting, path guards and
+                                 calculate_totals.
+   D4  Enter on a regular file   Open in $EDITOR (see section 5). Requires TerminalGuard::suspend /
+                                 resume.
+
+7.2 Corrections applied to this document
+
+   * Section 3 loop rewritten: worker drain moved into App::pump_worker (the original
+     took two simultaneous mutable borrows of App and could not compile).
+   * Section 3 worker: Progress emissions throttled to 50 ms / per-file.
+   * Section 4: added Destination Conflict, Self-Containment Check Path and
+     Cancelled Mid-File rows.
+   * Section 5: Enter-on-file behaviour specified.
+
+7.3 Phase 7 (post-1.0) - Configurable keybindings
+
+   Goal: remap keys, including a Vim-style scheme (h/j/k/l movement, y copy, x delete,
+   p paste, etc.) without recompiling.
+
+   Sketch of the design, deliberately deferred until v0.1 is stable:
+   * A plain-text config at $XDG_CONFIG_HOME/ferric-commander/keymap.conf, one binding
+     per line: "<context>.<action> = <key>[, <key>...]", where context is one of
+     normal, confirm, input, progress. Comments start with '#'.
+   * Parse into a Keymap struct of HashMap<KeyChord, Action>, where Action is a
+     #[non_exhaustive] enum (Quit, CycleTheme, Copy, Move, Rename, Delete, ...). The
+     existing hard-coded match in App::handle_key_event becomes a lookup of
+     KeyChord -> Action followed by a dispatch match, so the two concerns stay separate.
+   * KeyChord must model modifiers explicitly (KeyCode plus Modifiers) and be
+     Ord + Hash so duplicate detection at load time can warn about ambiguous bindings
+     instead of silently letting the last one win.
+   * Unknown action names and unparsable chords are collected and reported through a
+     single status message on startup; a broken config never prevents the app starting.
+   * A built-in default map mirrors today's function keys, so an absent config file is
+     not an error.
+
+8. Working Agreement
+
+   * Each phase ends with cargo build, cargo test and clippy clean, committed to git
+     with a message naming the phase.
+   * No unwrap/expect outside tests and startup paths that cannot continue.
+   * Every public item carries a doc comment explaining why it exists, not just what
+     it does; module headers state the invariant they are responsible for.
